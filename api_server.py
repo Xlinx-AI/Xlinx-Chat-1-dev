@@ -28,7 +28,7 @@ from slowapi.errors import RateLimitExceeded
 import uuid
 
 # Import the model and tokenizer from the training script or ensure they are accessible
-from training_script import OmniModalLLM, LiquidFoundationTokenizer, device
+from main import OmniModalLLM, LiquidFoundationTokenizer, device
 
 # ==========================================
 # API Models
