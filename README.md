@@ -1,5 +1,3 @@
-## English Version
-
 # OmniModalLLM
 
 OmniModalLLM is a versatile and powerful multimodal language model designed to handle both text and image inputs, enabling sophisticated conversational AI applications similar to ChatGPT. Leveraging advanced architectures like Mixture of Experts (MoE) and Vector Quantized Variational Autoencoders (VQVAE), OmniModalLLM offers robust performance and adaptability across various tasks.
@@ -13,6 +11,7 @@ OmniModalLLM is a versatile and powerful multimodal language model designed to h
 - **Chat API:** Provides a ChatGPT-like conversational interface using FastAPI.
 - **Memory Optimizations:** Implements techniques like gradient checkpointing and mixed precision training to prevent CUDA Out-Of-Memory (OOM) errors.
 - **Rate Limiting:** Protects the API from abuse using `slowapi`.
+- **Dynamic Response Generation Loop:** Enables the assistant to generate responses of arbitrary length by iteratively predicting tokens until an end-of-sequence token is encountered or a maximum token limit is reached.
 
 ## Table of Contents
 
@@ -63,15 +62,15 @@ pip install transformers datasets pillow fastapi uvicorn tiktoken einops tensorb
 
 ### Training
 
-OmniModalLLM is pre-configured to train on the MS COCO dataset. Ensure you have sufficient computational resources before initiating training.
+OmniModalLLM is pre-configured to train on the Flickr30k and DailyDialog datasets. Ensure you have sufficient computational resources before initiating training.
 
 ```bash
-python main.py
+python training_script.py
 ```
 
 This command will:
 
-1. Load and preprocess the MS COCO dataset.
+1. Load and preprocess the Flickr30k and DailyDialog datasets.
 2. Initialize the OmniModalLLM model and tokenizer.
 3. Start the training loop with mixed precision and gradient checkpointing.
 4. Save model checkpoints upon improvement.
@@ -93,8 +92,14 @@ The FastAPI server provides a `/chat/` endpoint for interactive conversations. O
 If you wish to run the API server without training, ensure the model is trained and load the saved checkpoint.
 
 ```bash
-python main.py --load_checkpoint path_to_checkpoint.pth.tar
+python api_server.py
 ```
+
+This command will:
+
+1. Load the trained OmniModalLLM model and tokenizer.
+2. Start the FastAPI server listening on `http://0.0.0.0:8000`.
+3. Expose the `/chat/` endpoint for interactive chat.
 
 ## API Endpoints
 
@@ -147,17 +152,41 @@ curl -X POST "http://localhost:8000/chat/" \
 }'
 ```
 
+**Response:**
+
+```json
+{
+  "session_id": "generated-session-id",
+  "message": {
+    "role": "assistant",
+    "content": "I'm doing well, thank you! How can I assist you today?"
+  }
+}
+```
+
 **Subsequent Request (Continue the Conversation):**
 
 ```bash
 curl -X POST "http://localhost:8000/chat/" \
 -H "Content-Type: application/json" \
 -d '{
-    "session_id": "unique-session-id",
+    "session_id": "existing-session-id",
     "messages": [
         {"role": "user", "content": "Can you tell me a joke?"}
     ]
 }'
+```
+
+**Response:**
+
+```json
+{
+  "session_id": "existing-session-id",
+  "message": {
+    "role": "assistant",
+    "content": "Sure! Why did the computer show up at work late? It had a hard drive!"
+  }
+}
 ```
 
 ### Using Postman
@@ -174,6 +203,10 @@ curl -X POST "http://localhost:8000/chat/" \
    
 4. **Send the Request:**
    - Observe the assistant's reply in the response section.
+
+### Creating a Simple Frontend
+
+For a more interactive experience, consider creating a simple frontend using frameworks like React, Vue, or even plain HTML/CSS/JavaScript. This frontend can interact with the FastAPI backend via the `/chat/` endpoint, allowing users to engage in conversations with the assistant through a web interface.
 
 ## Contributing
 
@@ -208,6 +241,7 @@ OmniModalLLM — это универсальная и мощная мульти�
 - **Чат API:** Предоставляет интерфейс для разговоров, похожий на ChatGPT, используя FastAPI.
 - **Оптимизация памяти:** Реализует такие методы, как градиентный чекпоинтинг и обучение с смешанной точностью, чтобы избежать ошибок Out-Of-Memory (OOM) на CUDA.
 - **Ограничение скорости запросов:** Защищает API от злоупотреблений с помощью `slowapi`.
+- **Динамический цикл генерации ответов:** Позволяет ассистенту генерировать ответы произвольной длины, итеративно предсказывая токены до появления токена конца последовательности или достижения максимального лимита токенов.
 
 ## Содержание
 
@@ -258,15 +292,15 @@ pip install transformers datasets pillow fastapi uvicorn tiktoken einops tensorb
 
 ### Обучение
 
-OmniModalLLM преднастроена для обучения на датасете MS COCO. Убедитесь, что у вас есть достаточные вычислительные ресурсы перед началом обучения.
+OmniModalLLM преднастроена для обучения на датасетах Flickr30k и DailyDialog. Убедитесь, что у вас есть достаточные вычислительные ресурсы перед началом обучения.
 
 ```bash
-python main.py
+python training_script.py
 ```
 
 Эта команда выполнит следующие действия:
 
-1. Загрузит и предварительно обработает датасет MS COCO.
+1. Загрузит и предварительно обработает датасеты Flickr30k и DailyDialog.
 2. Инициализирует модель OmniModalLLM и токенизатор.
 3. Запустит цикл обучения с использованием смешанной точности и градиентного чекпоинтинга.
 4. Сохранит чекпоинты модели при улучшении результатов.
@@ -288,8 +322,14 @@ python main.py
 Если вы хотите запустить API-сервер без обучения, убедитесь, что модель обучена и загрузите сохраненный чекпоинт.
 
 ```bash
-python main.py --load_checkpoint path_to_checkpoint.pth.tar
+python api_server.py
 ```
+
+Эта команда выполнит следующие действия:
+
+1. Загрузит обученную модель OmniModalLLM и токенизатор.
+2. Запустит сервер FastAPI, слушающий на `http://0.0.0.0:8000`.
+3. Предоставит эндпоинт `/chat/` для интерактивного чата.
 
 ## API Эндпоинты
 
@@ -346,10 +386,10 @@ curl -X POST "http://localhost:8000/chat/" \
 
 ```json
 {
-  "session_id": "unique-session-id",
+  "session_id": "generated-session-id",
   "message": {
     "role": "assistant",
-    "content": "Я модель, созданная для помощи вам. Чем могу помочь сегодня?"
+    "content": "Я делаю хорошо, спасибо! Чем могу помочь вам сегодня?"
   }
 }
 ```
@@ -360,7 +400,7 @@ curl -X POST "http://localhost:8000/chat/" \
 curl -X POST "http://localhost:8000/chat/" \
 -H "Content-Type: application/json" \
 -d '{
-    "session_id": "unique-session-id",
+    "session_id": "existing-session-id",
     "messages": [
         {"role": "user", "content": "Расскажи анекдот."}
     ]
@@ -371,10 +411,10 @@ curl -X POST "http://localhost:8000/chat/" \
 
 ```json
 {
-  "session_id": "unique-session-id",
+  "session_id": "existing-session-id",
   "message": {
     "role": "assistant",
-    "content": "Почему пчёлы никогда не опаздывают? Потому что они всегда на улье!"
+    "content": "Конечно! Почему компьютер опоздал на работу? Потому что у него был жесткий диск!"
   }
 }
 ```
@@ -396,7 +436,7 @@ curl -X POST "http://localhost:8000/chat/" \
 
 ### Создание простого фронтенда
 
-Для более интерактивного опыта рассмотрите возможность создания простого фронтенда с использованием таких фреймворков, как React, Vue или даже простого HTML/CSS/JavaScript. Этот фронтенд может взаимодействовать с бэкендом FastAPI через эндпоинт `/chat/`.
+Для более интерактивного опыта рассмотрите возможность создания простого фронтенда с использованием таких фреймворков, как React, Vue или даже простого HTML/CSS/JavaScript. Этот фронтенд может взаимодействовать с бэкендом FastAPI через эндпоинт `/chat/`, позволяя пользователям вести диалог с ассистентом через веб-интерфейс.
 
 ## Вклад
 
@@ -414,6 +454,42 @@ curl -X POST "http://localhost:8000/chat/" \
 
 Этот проект лицензирован под [MIT License](LICENSE).
 
+---
+
 ## Additional Information
 
 For further assistance, questions, or suggestions, please feel free to open an issue on the [GitHub repository](https://github.com/kirill670/OmniModalLLM/issues).
+
+---
+
+## Summary of Critical Additions and Corrections:
+
+1. **Dynamic Response Generation Loop in API Server:**
+   - **Purpose:** Allows the assistant to generate responses of arbitrary length by iteratively predicting the next token until an end-of-sequence token is generated or a maximum number of tokens is reached.
+   - **Implementation:** Added a loop in the `generate_response_api` function within the `api_server.py` script that handles token generation, temperature scaling, top-k and top-p sampling, and termination conditions.
+
+2. **Updated Features Section:**
+   - Included the **Dynamic Response Generation Loop** to highlight the model's capability to generate extensive and coherent responses.
+
+3. **Usage Instructions:**
+   - Enhanced the **API Deployment** section to explain the independent running of the API server and its functionalities.
+   - Updated the **Examples** section to reflect the ability to handle extended conversations and generate longer responses.
+
+4. **Concurrency and Thread Safety:**
+   - Ensured that the conversation history management in the API server is thread-safe using `threading.Lock` to prevent race conditions during concurrent access.
+
+5. **Rate Limiting:**
+   - Implemented rate limiting using `slowapi` to protect the API from abuse, with configurable request limits.
+
+6. **Error Handling Enhancements:**
+   - Added checks to handle scenarios where user messages are not provided, ensuring the assistant responds appropriately.
+
+7. **Device Compatibility:**
+   - Ensured that all tensors are correctly moved to the designated device (`CPU`, `GPU`, or `TPU`) to prevent device mismatch errors during training and inference.
+
+8. **Documentation Improvements:**
+   - Provided detailed instructions for setting up, training, and deploying the model.
+   - Included examples for using both `curl` and Postman to interact with the API.
+   - Suggested creating a frontend for enhanced user interaction.
+
+By incorporating these updates, the **OmniModalLLM** project now offers a more robust and flexible framework for developing advanced multimodal conversational AI applications.
