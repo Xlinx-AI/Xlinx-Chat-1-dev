@@ -1,4 +1,17 @@
-# api_server.py
+# ==========================================
+# Install Necessary Libraries
+# ==========================================
+
+# Uncomment and run these lines if you're setting up a new environment.
+# They ensure the correct versions of PyTorch and other dependencies are installed.
+
+# !pip install torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cu116
+# !pip install transformers datasets pillow fastapi uvicorn tiktoken einops tensorboard
+# !pip install faiss-cpu slowapi
+
+# ==========================================
+# Imports and Device Initialization
+# ==========================================
 
 import os
 import torch
@@ -15,7 +28,27 @@ from slowapi.errors import RateLimitExceeded
 import uuid
 
 # Import the model and tokenizer from the training script or ensure they are accessible
-from training_script import OmniModalLLM, LiquidFoundationTokenizer, device, conversation_history, generate_response
+from training_script import OmniModalLLM, LiquidFoundationTokenizer, device
+
+# ==========================================
+# API Models
+# ==========================================
+
+class ChatMessage(BaseModel):
+    role: str  # 'user' or 'assistant'
+    content: str
+
+class ChatRequest(BaseModel):
+    session_id: Optional[str] = None  # To manage conversation sessions
+    messages: List[ChatMessage]
+
+class ChatResponse(BaseModel):
+    session_id: str
+    message: ChatMessage
+
+# ==========================================
+# FastAPI Setup
+# ==========================================
 
 app = FastAPI()
 
@@ -24,7 +57,10 @@ limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# Initialize model and tokenizer
+# ==========================================
+# Initialize Model and Tokenizer
+# ==========================================
+
 def initialize_model_and_tokenizer(device: torch.device):
     """
     Initializes the OmniModalLLM model and the LiquidFoundationTokenizer.
@@ -44,10 +80,10 @@ def initialize_model_and_tokenizer(device: torch.device):
     num_layers = 3      # Adjust as per training
     hidden_dim = 64
     num_heads = 8
-    
+
     # Initialize the tokenizer
     tokenizer = LiquidFoundationTokenizer(device=device, adapt_dim=adapt_dim)
-    
+
     # Initialize the model
     model = OmniModalLLM(
         token_dim=token_dim,
@@ -70,39 +106,36 @@ def initialize_model_and_tokenizer(device: torch.device):
     ).to(device)
     
     # Load trained weights
-    model.load_model('checkpoint.pth.tar')
+    model.load_model('final_model.pth.tar')
     
     return model, tokenizer
 
 model, tokenizer = initialize_model_and_tokenizer(device=device)
 
-# API Models
-class ChatMessage(BaseModel):
-    role: str  # 'user' or 'assistant'
-    content: str
-
-class ChatRequest(BaseModel):
-    session_id: Optional[str] = None  # To manage conversation sessions
-    messages: List[ChatMessage]
-
-class ChatResponse(BaseModel):
-    session_id: str
-    message: ChatMessage
-
+# ==========================================
 # Conversation History Storage
-# Ensure conversation_history is a thread-safe structure if accessed concurrently
+# ==========================================
+
+# Simple in-memory storage for session histories
 from collections import defaultdict
 import threading
 
 conversation_history = defaultdict(list)
 history_lock = threading.Lock()
 
-# Inference Function
+# ==========================================
+# Inference Function with Generation Loop
+# ==========================================
+
 def generate_response_api(
     model: OmniModalLLM,
     tokenizer: LiquidFoundationTokenizer,
     user_text: str,
-    session_id: str
+    session_id: str,
+    max_new_tokens: int = 50,
+    temperature: float = 1.0,
+    top_k: int = 50,
+    top_p: float = 0.95
 ) -> str:
     """
     Generates a response from the assistant based on user input and conversation history.
@@ -112,13 +145,18 @@ def generate_response_api(
         tokenizer (LiquidFoundationTokenizer): Tokenizer for processing text and images.
         user_text (str): The latest message from the user.
         session_id (str): Identifier for the conversation session.
+        max_new_tokens (int): Maximum number of tokens to generate.
+        temperature (float): Sampling temperature.
+        top_k (int): Top-k sampling.
+        top_p (float): Nucleus (top-p) sampling.
 
     Returns:
         response_text (str): The assistant's generated response.
     """
     model.eval()  # Set model to evaluation mode
+    generated_tokens = []
     with torch.no_grad():
-        # Acquire lock to safely access conversation history
+        # Retrieve conversation history for the session
         with history_lock:
             history = conversation_history.get(session_id, []).copy()
         
@@ -133,29 +171,54 @@ def generate_response_api(
         # Append the latest user message
         conversation += f"User: {user_text}\nAssistant:"
         
-        # Tokenize the conversation
-        tokenized = tokenizer.text_tokenizer.tokenize(conversation)
-        tokens = tokenized['tokens'].unsqueeze(0).to(device)  # [1, seq]
-        
-        # Forward pass through the model
-        outputs = model(tokens, image_embeddings=None)  # Assuming text-only for chat
-        token_logits = outputs["token_logits"]  # [1, vocab_size]
-        
-        # Generate the assistant's response token
-        predicted_token_id = torch.argmax(token_logits, dim=-1)  # [1]
-        
-        # Detokenize to get the response text
-        response_text = tokenizer.text_tokenizer.detokenize(predicted_token_id)
-        
-        # Update conversation history
-        with history_lock:
-            conversation_history[session_id].append(
-                ChatMessage(role="assistant", content=response_text)
-            )
-        
-    return response_text.strip()
+        for _ in range(max_new_tokens):
+            # Tokenize the current conversation
+            tokenized = tokenizer.text_tokenizer.tokenize(conversation)
+            tokens = tokenized['tokens'].unsqueeze(0).to(device)  # [1, seq]
+            
+            # Forward pass through the model
+            outputs = model(tokens, image_embeddings=None)  # Assuming text-only for chat
+            token_logits = outputs["token_logits"]  # [batch, vocab_size]
+            
+            # Apply temperature scaling
+            token_logits = token_logits / temperature
+            
+            # Apply top-k and top-p filtering
+            sorted_logits, sorted_indices = torch.sort(token_logits, descending=True)
+            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
 
+            # Remove tokens with cumulative probability above the threshold
+            sorted_indices_to_remove = cumulative_probs > top_p
+            # Shift the indices to the right to keep the first token above the threshold
+            sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+            sorted_indices_to_remove[:, 0] = False
+
+            indices_to_remove = sorted_indices[sorted_indices_to_remove]
+            token_logits.scatter_(1, indices_to_remove, float('-inf'))
+
+            # Sample the next token
+            probabilities = F.softmax(token_logits, dim=-1)
+            next_token = torch.multinomial(probabilities, num_samples=1)  # [batch, 1]
+
+            # Detokenize to get the token string
+            token_id = next_token.squeeze(0).cpu().numpy()
+            token_str = tokenizer.text_tokenizer.detokenize(next_token.squeeze(0))
+            
+            # Append the token to the conversation
+            conversation += token_str
+            generated_tokens.append(token_str)
+            
+            # Check for end-of-sequence token
+            if tokenizer.encoder.eos_token_id and next_token.item() == tokenizer.encoder.eos_token_id:
+                break
+
+    response_text = ''.join(generated_tokens).strip()
+    return response_text
+
+# ==========================================
 # API Endpoint
+# ==========================================
+
 @app.post("/chat/", response_model=ChatResponse)
 @limiter.limit("20/minute")  # Limit to 20 requests per minute per IP
 async def chat_endpoint(request: ChatRequest, req: Request):
@@ -192,18 +255,32 @@ async def chat_endpoint(request: ChatRequest, req: Request):
             message=ChatMessage(role="assistant", content="I didn't receive any user message.")
         )
     
-    # Generate assistant's response
+    # Generate assistant's response with a generation loop
     assistant_reply = generate_response_api(
         model, 
         tokenizer, 
         user_message.content, 
-        session_id=session_id
+        session_id=session_id,
+        max_new_tokens=100,  # Adjust as needed
+        temperature=0.7,
+        top_k=50,
+        top_p=0.9
     )
+    
+    # Append assistant's reply to the conversation history
+    with history_lock:
+        conversation_history[session_id].append(
+            ChatMessage(role="assistant", content=assistant_reply)
+        )
     
     return ChatResponse(
         session_id=session_id,
         message=ChatMessage(role="assistant", content=assistant_reply)
     )
+
+# ==========================================
+# Entry Point
+# ==========================================
 
 if __name__ == "__main__":
     # Launch the API server
