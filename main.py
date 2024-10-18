@@ -423,7 +423,7 @@ class TextTokenizer(BaseTokenizer):
         self.encoder = encoder
         self.vocab_size = self.encoder.vocab_size
         self.pad_token = self.encoder.pad_token_id
-        self.embedding = nn.Embedding(self.vocab_size, 512)
+        self.embedding = nn.Embedding(self.vocab_size, 256)  # Уменьшено с 512
         self.adapt_dim = adapt_dim
         self.apply(initialize_weights)
 
@@ -477,7 +477,7 @@ class ImageTokenizer(BaseTokenizer):
 
 class LiquidFoundationTokenizer(nn.Module):
     """Foundation tokenizer handling both text and image modalities."""
-    def __init__(self, device: str = 'cpu', adapt_dim: int = 256):
+    def __init__(self, device: str = 'cpu', adapt_dim: int = 64):  # Уменьшено с 256
         super(LiquidFoundationTokenizer, self).__init__()
         self.encoder = LongformerTokenizer.from_pretrained('allenai/longformer-base-4096')
         self.text_tokenizer = TextTokenizer(self.encoder, adapt_dim=adapt_dim)
@@ -598,11 +598,53 @@ class AdaptiveConfiguration(nn.Module):
         return config_dict
 
 # ==========================================
+# Semantic Module
+# ==========================================
+
+class SemanticModule(nn.Module):
+    """Semantics understanding module to capture complex logic and abstract concepts."""
+    def __init__(self, input_dim: int, hidden_dim: int, num_heads: int, num_layers: int, adapt_dim: int, drop_prob: float = 0.1):
+        super(SemanticModule, self).__init__()
+        self.layers = nn.ModuleList([
+            nn.ModuleDict({
+                'liquid_linear': LiquidLinear(input_dim, hidden_dim, adapt_dim),
+                'attention': nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads, dropout=drop_prob),
+                'ffn': nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim * 4),
+                    nn.GELU(),
+                    nn.Dropout(drop_prob),
+                    nn.Linear(hidden_dim * 4, hidden_dim),
+                    nn.Dropout(drop_prob)
+                ),
+                'norm1': nn.LayerNorm(hidden_dim),
+                'norm2': nn.LayerNorm(hidden_dim),
+                'dropout': nn.Dropout(drop_prob)
+            })
+            for _ in range(num_layers)
+        ])
+        self.apply(initialize_weights)
+
+    def forward(self, x: torch.Tensor, adapt_input: torch.Tensor) -> torch.Tensor:
+        """Forward pass through the semantic module."""
+        for layer in self.layers:
+            # Apply Liquid Linear layer
+            x = layer['liquid_linear'](x, adapt_input)
+            
+            # Apply Multihead Attention
+            attn_output, _ = layer['attention'](x, x, x)
+            x = layer['norm1'](x + layer['dropout'](attn_output))
+            
+            # Apply Feed-Forward Network
+            ffn_output = layer['ffn'](x)
+            x = layer['norm2'](x + layer['dropout'](ffn_output))
+        return x
+
+# ==========================================
 # LFModel with Gradient Checkpointing
 # ==========================================
 
 class LFModel(nn.Module):
-    """Main model integrating LiquidLinear, MixtureOfExperts, attention, and component combination."""
+    """Main model integrating LiquidLinear, MixtureOfExperts, attention, component combination, and semantic module."""
     def __init__(
         self,
         token_dim: int,
@@ -610,18 +652,21 @@ class LFModel(nn.Module):
         expert_dim: int,
         adapt_dim: int,
         num_experts: int,
-        num_layers: int = 3,
-        hidden_dim: int = 64,
-        num_heads: int = 8,
+        num_layers: int = 2,  # Уменьшено с 3
+        hidden_dim: int = 32,  # Уменьшено с 64
+        num_heads: int = 4,     # Уменьшено с 8
+        semantic_hidden_dim: int = 128,  # Новая переменная
+        semantic_num_heads: int = 4,
+        semantic_num_layers: int = 1,
         dropout_rate: float = 0.1,
-        max_drop_prob: float = 0.1,
-        layerdrop_prob: float = 0.1,
+        max_drop_prob: float = 0.05,  # Уменьшено с 0.1
+        layerdrop_prob: float = 0.05,  # Уменьшено с 0.1
         dropblock_block_size: int = 7,
-        dropblock_prob: float = 0.1,
+        dropblock_prob: float = 0.05,  # Уменьшено с 0.1
         combination_activation: str = 'gelu',
         combination_norm_type: str = 'batchnorm',
         norm_type: str = 'batchnorm',
-        dynamic_layer_threshold: float = 0.5
+        dynamic_layer_threshold: float = 0.4  # Немного уменьшено
     ):
         super(LFModel, self).__init__()
         # Featurizer to generate adaptive input
@@ -716,11 +761,11 @@ class LFModel(nn.Module):
         return checkpoint(custom_forward, x, adapt_input)
 
 # ==========================================
-# OmniModal LLM Integrating All Components
+# OmniModal LLM Integrating All Components with Semantic Module
 # ==========================================
 
 class OmniModalLLM(nn.Module):
-    """Omnimodal LLM handling text and image data with integrated token prediction."""
+    """Omnimodal LLM handling text and image data with integrated token prediction and semantic understanding."""
     def __init__(
         self,
         token_dim: int,
@@ -728,18 +773,21 @@ class OmniModalLLM(nn.Module):
         expert_dim: int,
         adapt_dim: int,
         num_experts: int,
-        num_layers: int = 3,
-        hidden_dim: int = 64,
-        num_heads: int = 8,
+        num_layers: int = 2,  # Уменьшено с 3
+        hidden_dim: int = 32,  # Уменьшено с 64
+        num_heads: int = 4,     # Уменьшено с 8
+        semantic_hidden_dim: int = 128,  # Новая переменная
+        semantic_num_heads: int = 4,
+        semantic_num_layers: int = 1,
         dropout_rate: float = 0.1,
-        max_drop_prob: float = 0.1,
-        layerdrop_prob: float = 0.1,
+        max_drop_prob: float = 0.05,  # Уменьшено с 0.1
+        layerdrop_prob: float = 0.05,  # Уменьшено с 0.1
         dropblock_block_size: int = 7,
-        dropblock_prob: float = 0.1,
+        dropblock_prob: float = 0.05,  # Уменьшено с 0.1
         combination_activation: str = 'gelu',
         combination_norm_type: str = 'batchnorm',
         norm_type: str = 'batchnorm',
-        dynamic_layer_threshold: float = 0.5
+        dynamic_layer_threshold: float = 0.4  # Немного уменьшено
     ):
         super(OmniModalLLM, self).__init__()
         # Initialize LFModel
@@ -752,6 +800,9 @@ class OmniModalLLM(nn.Module):
             num_layers=num_layers,
             hidden_dim=hidden_dim,
             num_heads=num_heads,
+            semantic_hidden_dim=semantic_hidden_dim,
+            semantic_num_heads=semantic_num_heads,
+            semantic_num_layers=semantic_num_layers,
             dropout_rate=dropout_rate,
             max_drop_prob=max_drop_prob,
             layerdrop_prob=layerdrop_prob,
@@ -762,16 +813,29 @@ class OmniModalLLM(nn.Module):
             norm_type=norm_type,
             dynamic_layer_threshold=dynamic_layer_threshold
         ).to(device)
+        
         # Initialize LiquidVAE
         self.liquid_vae = VQVAE(num_embeddings=512, embedding_dim=256, commitment_cost=0.25).to(device)
+        
         # Initialize Adaptive Configuration
         self.adaptive_config = AdaptiveConfiguration(adapt_dim, num_layers).to(device)
+        
+        # Initialize Semantic Module
+        self.semantic_module = SemanticModule(
+            input_dim=token_dim, 
+            hidden_dim=semantic_hidden_dim, 
+            num_heads=semantic_num_heads, 
+            num_layers=semantic_num_layers,
+            adapt_dim=adapt_dim,
+            drop_prob=dropblock_prob
+        ).to(device)
+        
         # Token predictor to generate logits over vocabulary
-        self.token_predictor = nn.Linear(token_dim, 30522).to(device)  # Standard vocab size for Longformer
+        self.token_predictor = nn.Linear(semantic_hidden_dim, 30522).to(device)  # Standard vocab size for Longformer
         self.token_predictor.apply(initialize_weights)
 
     def forward(self, text_tokens: torch.Tensor, image_embeddings: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
-        """Forward pass through the OmniModalLLM."""
+        """Forward pass through the OmniModalLLM with semantic module."""
         # Concatenate text and image tokens along sequence dimension if image is provided
         if image_embeddings is not None:
             combined_input = torch.cat([text_tokens, image_embeddings], dim=1)  # [batch, seq+img_seq]
@@ -780,6 +844,7 @@ class OmniModalLLM(nn.Module):
         
         # Generate adaptive input by averaging over sequence dimension
         adapt_input = self.lf_model.featurizer(combined_input.mean(dim=1))  # [batch, adapt_dim]
+        
         # Generate adaptive configuration weights
         config = self.adaptive_config(adapt_input)
         
@@ -789,17 +854,20 @@ class OmniModalLLM(nn.Module):
             config_weights[key] = value.squeeze(-1)  # Remove last dimension if necessary
         
         # Pass through LFModel
-        output = self.lf_model(combined_input, config_weights)  # [batch, total_seq, token_dim]
+        lf_output = self.lf_model(combined_input, config_weights)  # [batch, total_seq, token_dim]
+        
+        # Pass through Semantic Module
+        semantic_output = self.semantic_module(lf_output, adapt_input)  # [batch, total_seq, semantic_hidden_dim]
         
         # Split output into text and image parts if image is provided
         if image_embeddings is not None:
             seq_length = text_tokens.shape[1]
-            text_output = output[:, :seq_length, :]  # [batch, seq, token_dim]
+            text_output = semantic_output[:, :seq_length, :]  # [batch, seq, semantic_hidden_dim]
         else:
-            text_output = output  # [batch, seq, token_dim]
+            text_output = semantic_output  # [batch, seq, semantic_hidden_dim]
         
         # Compute mean of text output for VAE
-        text_mean = text_output.mean(dim=1)  # [batch, token_dim]
+        text_mean = text_output.mean(dim=1)  # [batch, semantic_hidden_dim]
         
         # Pass through LiquidVAE
         vae_outputs = self.liquid_vae(text_mean)
@@ -810,7 +878,7 @@ class OmniModalLLM(nn.Module):
         
         # Return outputs
         return {
-            "output": output,
+            "output": semantic_output,
             "token_logits": token_logits,
             "vae_reconstructed": reconstructed_text,
             "vq_loss": vae_outputs["vq_loss"],
@@ -999,15 +1067,18 @@ def initialize_model_and_tokenizer(device: torch.device):
         model (OmniModalLLM): The multimodal model.
         tokenizer (LiquidFoundationTokenizer): The tokenizer for processing text and images.
     """
-    token_dim = 512
-    channel_dim = 512
-    expert_dim = 256    # Adjust as per training
-    adapt_dim = 128     # Adjust as per training
-    num_experts = 4     # Adjust as per training
-    num_layers = 3      # Adjust as per training
-    hidden_dim = 64
-    num_heads = 8
-
+    token_dim = 256  # Уменьшено с 512
+    channel_dim = 256  # Уменьшено с 512
+    expert_dim = 128    # Уменьшено с 256
+    adapt_dim = 64     # Уменьшено с 128
+    num_experts = 2     # Уменьшено с 4
+    num_layers = 2      # Уменьшено с 3
+    hidden_dim = 32     # Уменьшено с 64
+    num_heads = 4       # Уменьшено с 8
+    semantic_hidden_dim = 128  # Новая переменная
+    semantic_num_heads = 4      # Уменьшено с 8
+    semantic_num_layers = 1     # Уменьшено с 2
+    
     # Initialize the tokenizer
     tokenizer = LiquidFoundationTokenizer(device=device, adapt_dim=adapt_dim)
 
@@ -1021,15 +1092,18 @@ def initialize_model_and_tokenizer(device: torch.device):
         num_layers=num_layers,
         hidden_dim=hidden_dim,
         num_heads=num_heads,
+        semantic_hidden_dim=semantic_hidden_dim,
+        semantic_num_heads=semantic_num_heads,
+        semantic_num_layers=semantic_num_layers,
         dropout_rate=0.1,
-        max_drop_prob=0.1,
-        layerdrop_prob=0.1,
+        max_drop_prob=0.05,  # Уменьшено с 0.1
+        layerdrop_prob=0.05,  # Уменьшено с 0.1
         dropblock_block_size=7,
-        dropblock_prob=0.1,
+        dropblock_prob=0.05,  # Уменьшено с 0.1
         combination_activation='gelu',
         combination_norm_type='batchnorm',
         norm_type='batchnorm',
-        dynamic_layer_threshold=0.5
+        dynamic_layer_threshold=0.4  # Немного уменьшено
     ).to(device)
 
     return model, tokenizer
@@ -1233,7 +1307,7 @@ def main():
     parser = argparse.ArgumentParser(description="OmniModal LLM Training and API Server")
     parser.add_argument('--mode', type=str, choices=['train', 'serve'], required=True, help="Mode to run the script: 'train' or 'serve'")
     parser.add_argument('--epochs', type=int, default=5, help="Number of training epochs")
-    parser.add_argument('--batch_size', type=int, default=4, help="Batch size for training")
+    parser.add_argument('--batch_size', type=int, default=2, help="Batch size for training")  # Уменьшено с 4
     parser.add_argument('--checkpoint', type=str, default='checkpoint.pth.tar', help="Path to save/load model checkpoints")
     parser.add_argument('--learning_rate', type=float, default=1e-4, help="Learning rate for optimizer")
     args = parser.parse_args()
