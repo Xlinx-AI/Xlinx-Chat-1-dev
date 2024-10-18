@@ -111,12 +111,16 @@ class TextTokenizer(nn.Module):
         else:
             tokens = tokens[:max_length]
         tokens_tensor = torch.tensor(tokens)
-        embeddings = self.embedding(tokens_tensor).unsqueeze(0)
+        embeddings = self.embedding(tokens_tensor).unsqueeze(0)  # Shape: [1, seq_length, embedding_dim]
         return {"tokens": tokens_tensor, "embeddings": embeddings}
 
     def detokenize(self, tokens: torch.Tensor) -> str:
         token_ids = tokens.cpu().numpy()
         return self.encoder.decode(token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+    
+    # Expose the embedding layer for inference
+    def get_embedding(self, token_ids: torch.Tensor) -> torch.Tensor:
+        return self.embedding(token_ids)
 
 class LiquidFoundationTokenizer(nn.Module):
     def __init__(self, adapt_dim: int = 64):
@@ -151,7 +155,7 @@ class ChatIterableDataset(IterableDataset):
                     tokenized = self.tokenizer.tokenize(text, max_length=self.max_length)
                     yield {
                         'tokens': tokenized['tokens'],
-                        'embeddings': tokenized['embeddings']
+                        'embeddings': tokenized['embeddings'].squeeze(0)  # Shape: [seq_length, embedding_dim]
                     }
             elif isinstance(sample, str):
                 text = sample
@@ -159,11 +163,10 @@ class ChatIterableDataset(IterableDataset):
                     tokenized = self.tokenizer.tokenize(text, max_length=self.max_length)
                     yield {
                         'tokens': tokenized['tokens'],
-                        'embeddings': tokenized['embeddings']
+                        'embeddings': tokenized['embeddings'].squeeze(0)  # Shape: [seq_length, embedding_dim]
                     }
             else:
                 continue
-
 
 class VectorQuantizer(nn.Module):
     def __init__(self, num_embeddings: int, embedding_dim: int, commitment_cost: float):
@@ -196,7 +199,7 @@ class VectorQuantizer(nn.Module):
         }
 
 class VQVAE(nn.Module):
-    def __init__(self, num_embeddings: int = 512, embedding_dim: int = 64, commitment_cost: float = 0.25):
+    def __init__(self, num_embeddings: int = 512, embedding_dim: int = 256, commitment_cost: float = 0.25):
         super(VQVAE, self).__init__()
         self.encoder = nn.Sequential(
             LiquidLinear(256, 128, adapt_dim=64),
@@ -219,10 +222,10 @@ class VQVAE(nn.Module):
     def forward(self, x: torch.Tensor, adapt_input: torch.Tensor = None):
         if adapt_input is None:
             adapt_input = torch.zeros(x.size(0), 64).to(x.device)
-        z_e = self.encoder(x, adapt_input)
-        vq_outputs = self.vq_layer(z_e)
-        z_q = vq_outputs["quantized"]
-        x_recon = self.decoder(z_q, adapt_input)
+        z_e = self.encoder(x, adapt_input)  # Shape: [batch_size, embedding_dim=256]
+        vq_outputs = self.vq_layer(z_e)  # Quantized tensor and losses
+        z_q = vq_outputs["quantized"]  # [batch_size, embedding_dim=256]
+        x_recon = self.decoder(z_q, adapt_input)  # [batch_size, 256]
         return {
             "quantized": z_q,
             "vq_loss": vq_outputs["vq_loss"],
@@ -244,8 +247,8 @@ class KolmogorovArnoldExpert(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         phi_outputs = [phi(x[:, i].unsqueeze(1)) for i, phi in enumerate(self.phi_functions)]
-        concatenated = torch.cat(phi_outputs, dim=1)
-        return self.psi_function(concatenated)
+        concatenated = torch.cat(phi_outputs, dim=1)  # [batch_size, input_dim * hidden_dim]
+        return self.psi_function(concatenated)  # [batch_size, output_dim]
 
 class MixtureOfExperts(nn.Module):
     def __init__(self, expert_dim: int, num_experts: int, adapt_dim: int, hidden_dim: int = 64, drop_prob: float = 0.0, activation: str = 'gelu'):
@@ -257,15 +260,15 @@ class MixtureOfExperts(nn.Module):
         self.apply(initialize_weights)
 
     def forward(self, x: torch.Tensor, adapt_input: torch.Tensor) -> torch.Tensor:
-        gate_scores = F.softmax(self.gating(adapt_input), dim=-1)
+        gate_scores = F.softmax(self.gating(adapt_input), dim=-1)  # [batch_size, num_experts +1]
         expert_outputs = [
-            gate_scores[:, i].unsqueeze(1) * expert(x, adapt_input)
+            gate_scores[:, i].unsqueeze(1) * expert(x, adapt_input)  # [batch_size, 1, expert_dim]
             for i, expert in enumerate(self.experts)
         ]
-        ka_output = gate_scores[:, -1].unsqueeze(1) * self.ka_expert(x)
+        ka_output = gate_scores[:, -1].unsqueeze(1) * self.ka_expert(x)  # [batch_size, 1, expert_dim]
         expert_outputs.append(ka_output)
-        output = sum(expert_outputs)
-        return self.drop_path(output)
+        output = torch.cat(expert_outputs, dim=1).sum(dim=1)  # [batch_size, expert_dim]
+        return self.drop_path(output)  # [batch_size, expert_dim]
 
 class ComponentCombination(nn.Module):
     def __init__(self, input_dims: List[int], hidden_dim: int = 128, dropout_rate: float = 0.1, activation: str = 'gelu', norm_type: str = 'batchnorm'):
@@ -284,20 +287,26 @@ class ComponentCombination(nn.Module):
         self.apply(initialize_weights)
 
     def forward(self, component_outputs: List[torch.Tensor]) -> torch.Tensor:
-        concatenated = torch.cat(component_outputs, dim=-1)
-        x = concatenated.permute(0, 2, 1)
+        concatenated = torch.cat(component_outputs, dim=-1)  # [batch_size, sum(input_dims)]
+        x = concatenated.unsqueeze(2)  # [batch_size, sum(input_dims), 1]
         x = self.norm(x)
-        x = x.permute(0, 2, 1)
-        residual = self.residual_fc(concatenated)
-        x = self.fc1(concatenated)
+        x = x.squeeze(2)  # [batch_size, sum(input_dims)]
+        residual = self.residual_fc(concatenated)  # [batch_size, sum(input_dims)]
+        x = self.fc1(concatenated)  # [batch_size, hidden_dim]
         x = self.act1(x)
         x = self.dropout(x)
-        weights = self.fc2(x)
-        weights = self.softmax(weights)
-        weights = weights.split(1, dim=-1)
-        combined_output = sum(w * out for w, out in zip(weights, component_outputs))
-        combined_output += residual
-        return combined_output
+        weights = self.fc2(x)  # [batch_size, len(input_dims)]
+        weights = self.softmax(weights)  # [batch_size, len(input_dims)]
+        weights = weights.unsqueeze(-1)  # [batch_size, len(input_dims), 1]
+        # Stack component_outputs to [batch_size, len(input_dims), feature_dim_i]
+        # Assuming all feature_dim_i are the same, else adjust accordingly
+        # Here, feature_dim_i vary, so we need to adjust
+        # Instead, perform element-wise multiplication and sum
+        combined_output = 0
+        for i, out in enumerate(component_outputs):
+            combined_output += weights[:, i, 0] * out  # [batch_size, feature_dim_i]
+        combined_output += residual  # [batch_size, sum(input_dims)]
+        return combined_output  # [batch_size, sum(input_dims)]
 
 class AdaptiveConfiguration(nn.Module):
     def __init__(self, adapt_dim: int, num_layers: int):
@@ -317,20 +326,21 @@ class AdaptiveConfiguration(nn.Module):
         )
         self.apply(initialize_weights)
 
-    def forward(self, adapt_input: torch.Tensor) -> Dict[str, torch.Tensor]:
-        config = self.config_net(adapt_input)
+    def forward(self, adapt_input: torch.Tensor) -> Dict[str, float]:
+        config = self.config_net(adapt_input)  # Shape: [batch_size, num_layers * 4]
         config = F.softmax(config, dim=-1)
-        reflection = self.reflection_net(config)
+        reflection = self.reflection_net(config)  # Shape: [batch_size, num_layers * 4]
         reflection = torch.sigmoid(reflection)
         adjusted_config = config * reflection
         adjusted_config = F.softmax(adjusted_config, dim=-1)
-        adjusted_config = adjusted_config.view(-1, self.num_layers, 4)
+        adjusted_config = adjusted_config.view(-1, self.num_layers, 4)  # [batch_size, num_layers, 4]
         config_dict = {}
         for layer in range(self.num_layers):
-            config_dict[f"layer_{layer+1}_moe_weight"] = adjusted_config[:, layer, 0]
-            config_dict[f"layer_{layer+1}_token_mixer_weight"] = adjusted_config[:, layer, 1]
-            config_dict[f"layer_{layer+1}_channel_mixer_weight"] = adjusted_config[:, layer, 2]
-            config_dict[f"layer_{layer+1}_attention_weight"] = adjusted_config[:, layer, 3]
+            # Average over the batch to obtain scalar weights
+            config_dict[f"layer_{layer+1}_moe_weight"] = adjusted_config[:, layer, 0].mean().item()
+            config_dict[f"layer_{layer+1}_token_mixer_weight"] = adjusted_config[:, layer, 1].mean().item()
+            config_dict[f"layer_{layer+1}_channel_mixer_weight"] = adjusted_config[:, layer, 2].mean().item()
+            config_dict[f"layer_{layer+1}_attention_weight"] = adjusted_config[:, layer, 3].mean().item()
         return config_dict
 
 class SemanticModule(nn.Module):
@@ -357,14 +367,14 @@ class SemanticModule(nn.Module):
 
     def forward(self, x: torch.Tensor, adapt_input: torch.Tensor) -> torch.Tensor:
         for layer in self.layers:
-            x = layer['liquid_linear'](x, adapt_input)
-            x_transposed = x.permute(1, 0, 2)
-            attn_output, _ = layer['attention'](x_transposed, x_transposed, x_transposed)
-            attn_output = attn_output.permute(1, 0, 2)
-            x = layer['norm1'](x + layer['dropout'](attn_output))
-            ffn_output = layer['ffn'](x)
-            x = layer['norm2'](x + layer['dropout'](ffn_output))
-        return x
+            x = layer['liquid_linear'](x, adapt_input)  # [batch_size, hidden_dim]
+            x = x.unsqueeze(0)  # [1, batch_size, hidden_dim] for MultiheadAttention
+            attn_output, _ = layer['attention'](x, x, x)  # [1, batch_size, hidden_dim]
+            attn_output = attn_output.squeeze(0)  # [batch_size, hidden_dim]
+            x = layer['norm1'](x.squeeze(0) + layer['dropout'](attn_output))  # [batch_size, hidden_dim]
+            ffn_output = layer['ffn'](x)  # [batch_size, hidden_dim]
+            x = layer['norm2'](x + layer['dropout'](ffn_output))  # [batch_size, hidden_dim]
+        return x  # [batch_size, hidden_dim]
 
 class LFModel(nn.Module):
     def __init__(
@@ -424,7 +434,7 @@ class LFModel(nn.Module):
         self.output_layer.apply(initialize_weights)
 
     def forward(self, x: torch.Tensor, config_weights: Optional[Dict[str, float]] = None) -> torch.Tensor:
-        adapt_input = self.featurizer(x.mean(dim=1))
+        adapt_input = self.featurizer(x.mean(dim=1))  # [batch_size, adapt_dim]
         if config_weights is None:
             config_weights = {}
             for i in range(len(self.layers)):
@@ -448,17 +458,17 @@ class LFModel(nn.Module):
                 continue
             x = layer['layerdrop'](x, lambda x_inner: self._process_layer(layer, x_inner, adapt_input))
         x = self.dropblock(x)
-        output = self.output_layer(x)
+        output = self.output_layer(x)  # [batch_size, token_dim=256]
         return output
 
     def _process_layer(self, layer: nn.ModuleDict, x: torch.Tensor, adapt_input: torch.Tensor) -> torch.Tensor:
         def custom_forward(x_inner, adapt_input_inner):
-            token_output = layer['token_mixer'](x_inner, adapt_input_inner)
-            channel_output = layer['channel_mixer'](x_inner, adapt_input_inner)
-            moe_output = layer['moe'](x_inner, adapt_input_inner)
-            attention_output = self.longformer(x_inner)[0]
+            token_output = layer['token_mixer'](x_inner, adapt_input_inner)  # [batch_size, 256]
+            channel_output = layer['channel_mixer'](x_inner, adapt_input_inner)  # [batch_size, 256]
+            moe_output = layer['moe'](x_inner, adapt_input_inner)  # [batch_size, 128]
+            attention_output = self.longformer(x_inner)[0].mean(dim=1)  # [batch_size, 768]
             component_outputs = [token_output, channel_output, moe_output, attention_output]
-            combined_output = layer['combiner'](component_outputs)
+            combined_output = layer['combiner'](component_outputs)  # [batch_size, 1408]
             return combined_output
         return checkpoint_utils.checkpoint(custom_forward, x, adapt_input)
 
@@ -515,7 +525,7 @@ class XlinxChatModel(nn.Module):
             param.requires_grad = False
         self.adaptive_config = AdaptiveConfiguration(adapt_dim, num_layers).to(device)
         self.semantic_module = SemanticModule(
-            input_dim=token_dim, 
+            input_dim=256,  # token_dim
             hidden_dim=semantic_hidden_dim, 
             num_heads=semantic_num_heads, 
             num_layers=semantic_num_layers,
@@ -527,17 +537,18 @@ class XlinxChatModel(nn.Module):
         self.cache = dc.Cache('./cache')
 
     def forward(self, text_tokens: torch.Tensor, image_embeddings: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
-        combined_input = text_tokens
-        adapt_input = self.lf_model.featurizer(combined_input.mean(dim=1))
-        config = self.adaptive_config(adapt_input)
-        config_weights = {key: value.squeeze(-1) for key, value in config.items()}
-        lf_output = self.lf_model(combined_input, config_weights)
-        semantic_output = self.semantic_module(lf_output, adapt_input)
+        # text_tokens: [batch_size, seq_length, embedding_dim=256]
+        combined_input = text_tokens  # [batch_size, seq_length, 256]
+        adapt_input = self.lf_model.featurizer(combined_input.mean(dim=1))  # [batch_size, adapt_dim=64]
+        config = self.adaptive_config(adapt_input)  # Dict[str, float]
+        config_weights = {key: value for key, value in config.items()}  # Scalars
+        lf_output = self.lf_model(combined_input, config_weights)  # [batch_size, token_dim=256]
+        semantic_output = self.semantic_module(lf_output.unsqueeze(1), adapt_input)  # [batch_size, hidden_dim=128]
         text_output = semantic_output
-        text_mean = text_output.mean(dim=1)
-        vae_outputs = self.liquid_vae(text_mean)
+        text_mean = text_output.mean(dim=1)  # [batch_size, semantic_hidden_dim=128]
+        vae_outputs = self.liquid_vae(text_mean)  # Reconstructed text
         reconstructed_text = vae_outputs["reconstructed"]
-        token_logits = self.token_predictor(text_output.mean(dim=1))
+        token_logits = self.token_predictor(text_output)  # [batch_size, 30522]
         return {
             "output": semantic_output,
             "token_logits": token_logits,
@@ -629,10 +640,10 @@ def train_model_meta(
             support_batch = flickr_batch
             query_batch = chat_batch
             # Use embeddings instead of tokens
-            support_inputs = support_batch['embeddings'].squeeze(1)  # Adjust dimensions if necessary
-            support_targets = support_batch['tokens'][:, 1:].contiguous()
-            query_inputs = query_batch['embeddings'].squeeze(1)  # Adjust dimensions if necessary
-            query_targets = query_batch['tokens'][:, 1:].contiguous()
+            support_inputs = support_batch['embeddings'].to(device)  # [batch_size, seq_length, embedding_dim=256]
+            support_targets = support_batch['tokens'][:, 1:].contiguous().to(device)  # [batch_size, seq_length -1]
+            query_inputs = query_batch['embeddings'].to(device)  # [batch_size, seq_length, embedding_dim=256]
+            query_targets = query_batch['tokens'][:, 1:].contiguous().to(device)  # [batch_size, seq_length -1]
             if scaler:
                 with autocast():
                     support_outputs = model(support_inputs, image_embeddings=None)
@@ -674,12 +685,11 @@ def train_model_meta(
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= patience:
+                print("Early stopping triggered.")
                 break
         scheduler.step(avg_loss)
         writer.add_scalar('Learning Rate', meta_learner.meta_optimizer.param_groups[0]['lr'], epoch)
     writer.close()
-
-
 
 def generate_response_api(
     model: 'XlinxChatModel',
@@ -696,12 +706,12 @@ def generate_response_api(
     with torch.no_grad():
         conversation_history = "User: " + user_text + "\nAssistant:"
         tokenized = tokenizer.text_tokenizer.tokenize(conversation_history)
-        embeddings = tokenized['embeddings'].to(device)  # Use embeddings
-        tokens = embeddings.squeeze(1)  # Adjust dimensions if necessary
+        embeddings = tokenized['embeddings'].unsqueeze(0).to(device)  # [1, seq_length, embedding_dim=256]
+        tokens = embeddings  # [1, seq_length, 256]
         for _ in range(max_new_tokens):
             with autocast(enabled=(device.type == 'cuda')):
                 outputs = model(tokens, image_embeddings=None)
-                token_logits = outputs["token_logits"]
+                token_logits = outputs["token_logits"]  # [1, 30522]
                 token_logits = token_logits / temperature
                 sorted_logits, sorted_indices = torch.sort(token_logits, descending=True)
                 cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
@@ -711,21 +721,17 @@ def generate_response_api(
                 indices_to_remove = sorted_indices[sorted_indices_to_remove]
                 token_logits.scatter_(1, indices_to_remove, float('-inf'))
                 probabilities = F.softmax(token_logits, dim=-1)
-                next_token = torch.multinomial(probabilities, num_samples=1)
+                next_token = torch.multinomial(probabilities, num_samples=1)  # [1, 1]
                 token_str = tokenizer.text_tokenizer.detokenize(next_token.squeeze(0))
-                conversation_history += token_str
-                
-                # Retrieve the embedding for the next_token
-                new_embedding = tokenizer.text_tokenizer.embedding(next_token).squeeze(1)  # Adjust dimensions as needed
-                tokens = torch.cat([tokens, new_embedding.to(device)], dim=1)
                 generated_tokens.append(token_str)
-                
+                conversation_history += token_str
                 if tokenizer.encoder.eos_token_id and next_token.item() == tokenizer.encoder.eos_token_id:
                     break
+                # Get the embedding for the new token
+                new_embedding = tokenizer.text_tokenizer.get_embedding(next_token).unsqueeze(0)  # [1, 1, 256]
+                tokens = torch.cat([tokens, new_embedding.to(device)], dim=1)  # [1, seq_length +1, 256]
     response_text = ''.join(generated_tokens).strip()
     return response_text
-
-
 
 def generate_response_gradio(user_text):
     assistant_reply = generate_response_api(
@@ -840,8 +846,9 @@ def main():
                     except StopIteration:
                         break
                     support_batch = chat_batch
-                    support_inputs = support_batch['tokens']
-                    support_targets = support_batch['tokens'][:, 1:].contiguous()
+                    # Use embeddings instead of tokens
+                    support_inputs = support_batch['embeddings'].to(device)  # [batch_size, seq_length, 256]
+                    support_targets = support_batch['tokens'][:, 1:].contiguous().to(device)  # [batch_size, seq_length -1]
                     if scaler:
                         with autocast():
                             outputs = model(support_inputs, image_embeddings=None)
@@ -878,6 +885,7 @@ def main():
                 else:
                     epochs_no_improve += 1
                     if epochs_no_improve >= 3:
+                        print("Early stopping triggered.")
                         break
                 scheduler.step(avg_loss)
                 writer.add_scalar('Learning Rate', optimizer.param_groups[0]['lr'], epoch)
@@ -885,6 +893,7 @@ def main():
     elif args.mode == 'serve':
         if os.path.exists(args.checkpoint):
             model.load_model(args.checkpoint)
+            print(f"Loaded model checkpoint from '{args.checkpoint}'.")
         else:
             print(f"No checkpoint found at '{args.checkpoint}'. Please train the model first.")
             return
