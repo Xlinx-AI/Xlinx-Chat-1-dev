@@ -12,6 +12,7 @@ import higher
 import pandas as pd
 from tqdm import tqdm
 import diskcache as dc
+from datasets import load_dataset
 import zlib
 import numpy as np
 from PIL import Image
@@ -564,7 +565,7 @@ class XlinxChatModel(nn.Module):
         self.to(device)
 
 class MetaLearner:
-    def __init__(self, model, inner_lr=1e-2, meta_lr=1e-3, device='cpu'):
+    def __init__(self, model, inner_lr=1e-2, meta_lr=1e-3, device='cuda'):
         self.model = model
         self.inner_lr = inner_lr
         self.meta_lr = meta_lr
@@ -612,7 +613,7 @@ def train_model_meta(
         flickr_iter = iter(flickr_dataloader)
         chat_iter = iter(chat_dataloader)
         steps = 0
-        for step in tqdm(range(1000), desc="Meta-Training"):
+        for step in tqdm(range(10), desc="Meta-Training"):
             try:
                 flickr_batch = next(flickr_iter)
                 chat_batch = next(chat_iter)
@@ -816,7 +817,7 @@ def main():
                 epoch_loss = 0.0
                 chat_iter = iter(chat_dataloader)
                 steps = 0
-                for step in tqdm(range(1000), desc="Training"):
+                for step in tqdm(range(10), desc="Training"):
                     try:
                         chat_batch = next(chat_iter)
                     except StopIteration:
