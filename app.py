@@ -146,17 +146,24 @@ class ChatIterableDataset(IterableDataset):
     def __iter__(self):
         for sample in self.dataset:
             if isinstance(sample, dict):
-                text = sample.get('text', '')  # Changed 'caption' to 'text'
+                text = sample.get('text', '')  # Ensure 'text' key exists
                 if len(text) > 0:
                     tokenized = self.tokenizer.tokenize(text, max_length=self.max_length)
-                    yield {'tokens': tokenized['tokens']}
+                    yield {
+                        'tokens': tokenized['tokens'],
+                        'embeddings': tokenized['embeddings']
+                    }
             elif isinstance(sample, str):
                 text = sample
                 if len(text) > 0:
                     tokenized = self.tokenizer.tokenize(text, max_length=self.max_length)
-                    yield {'tokens': tokenized['tokens']}
+                    yield {
+                        'tokens': tokenized['tokens'],
+                        'embeddings': tokenized['embeddings']
+                    }
             else:
                 continue
+
 
 class VectorQuantizer(nn.Module):
     def __init__(self, num_embeddings: int, embedding_dim: int, commitment_cost: float):
@@ -622,9 +629,9 @@ def train_model_meta(
             support_batch = flickr_batch
             query_batch = chat_batch
             # Use embeddings instead of tokens
-            support_inputs = support_batch['embeddings']
+            support_inputs = support_batch['embeddings'].squeeze(1)  # Adjust dimensions if necessary
             support_targets = support_batch['tokens'][:, 1:].contiguous()
-            query_inputs = query_batch['embeddings']
+            query_inputs = query_batch['embeddings'].squeeze(1)  # Adjust dimensions if necessary
             query_targets = query_batch['tokens'][:, 1:].contiguous()
             if scaler:
                 with autocast():
@@ -673,12 +680,13 @@ def train_model_meta(
     writer.close()
 
 
+
 def generate_response_api(
     model: 'XlinxChatModel',
     tokenizer: 'LiquidFoundationTokenizer',
     user_text: str,
     session_id: str,
-    max_new_tokens: int = 500000,
+    max_new_tokens: int = 50,
     temperature: float = 1.0,
     top_k: int = 50,
     top_p: float = 0.95
@@ -689,7 +697,7 @@ def generate_response_api(
         conversation_history = "User: " + user_text + "\nAssistant:"
         tokenized = tokenizer.text_tokenizer.tokenize(conversation_history)
         embeddings = tokenized['embeddings'].to(device)  # Use embeddings
-        tokens = embeddings  # Assuming model expects embeddings
+        tokens = embeddings.squeeze(1)  # Adjust dimensions if necessary
         for _ in range(max_new_tokens):
             with autocast(enabled=(device.type == 'cuda')):
                 outputs = model(tokens, image_embeddings=None)
@@ -706,12 +714,17 @@ def generate_response_api(
                 next_token = torch.multinomial(probabilities, num_samples=1)
                 token_str = tokenizer.text_tokenizer.detokenize(next_token.squeeze(0))
                 conversation_history += token_str
-                embeddings = torch.cat([embeddings, next_token.float().to(device)], dim=1)  # Ensure embeddings are updated correctly
+                
+                # Retrieve the embedding for the next_token
+                new_embedding = tokenizer.text_tokenizer.embedding(next_token).squeeze(1)  # Adjust dimensions as needed
+                tokens = torch.cat([tokens, new_embedding.to(device)], dim=1)
                 generated_tokens.append(token_str)
+                
                 if tokenizer.encoder.eos_token_id and next_token.item() == tokenizer.encoder.eos_token_id:
                     break
     response_text = ''.join(generated_tokens).strip()
     return response_text
+
 
 
 def generate_response_gradio(user_text):
