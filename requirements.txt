@@ -1,0 +1,11 @@
+torch
+transformers
+gradio
+diskcache
+datasets
+tqdm
+numpy
+Pillow
+torchvision
+torchmeta
+higher
