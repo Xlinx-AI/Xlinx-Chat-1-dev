@@ -111,7 +111,7 @@ class TextTokenizer(nn.Module):
         else:
             tokens = tokens[:max_length]
         tokens_tensor = torch.tensor(tokens)
-        embeddings = self.embedding(tokens_tensor).unsqueeze(0)  # Shape: [1, seq_length, embedding_dim]
+        embeddings = self.embedding(tokens_tensor).unsqueeze(0)  # Shape: [1, seq_length, embedding_dim=256]
         return {"tokens": tokens_tensor, "embeddings": embeddings}
 
     def detokenize(self, tokens: torch.Tensor) -> str:
@@ -155,7 +155,7 @@ class ChatIterableDataset(IterableDataset):
                     tokenized = self.tokenizer.tokenize(text, max_length=self.max_length)
                     yield {
                         'tokens': tokenized['tokens'],
-                        'embeddings': tokenized['embeddings'].squeeze(0)  # Shape: [seq_length, embedding_dim]
+                        'embeddings': tokenized['embeddings'].squeeze(0)  # Shape: [seq_length, embedding_dim=256]
                     }
             elif isinstance(sample, str):
                 text = sample
@@ -163,7 +163,7 @@ class ChatIterableDataset(IterableDataset):
                     tokenized = self.tokenizer.tokenize(text, max_length=self.max_length)
                     yield {
                         'tokens': tokenized['tokens'],
-                        'embeddings': tokenized['embeddings'].squeeze(0)  # Shape: [seq_length, embedding_dim]
+                        'embeddings': tokenized['embeddings'].squeeze(0)  # Shape: [seq_length, embedding_dim=256]
                     }
             else:
                 continue
@@ -298,10 +298,6 @@ class ComponentCombination(nn.Module):
         weights = self.fc2(x)  # [batch_size, len(input_dims)]
         weights = self.softmax(weights)  # [batch_size, len(input_dims)]
         weights = weights.unsqueeze(-1)  # [batch_size, len(input_dims), 1]
-        # Stack component_outputs to [batch_size, len(input_dims), feature_dim_i]
-        # Assuming all feature_dim_i are the same, else adjust accordingly
-        # Here, feature_dim_i vary, so we need to adjust
-        # Instead, perform element-wise multiplication and sum
         combined_output = 0
         for i, out in enumerate(component_outputs):
             combined_output += weights[:, i, 0] * out  # [batch_size, feature_dim_i]
@@ -374,7 +370,7 @@ class SemanticModule(nn.Module):
             x = layer['norm1'](x.squeeze(0) + layer['dropout'](attn_output))  # [batch_size, hidden_dim]
             ffn_output = layer['ffn'](x)  # [batch_size, hidden_dim]
             x = layer['norm2'](x + layer['dropout'](ffn_output))  # [batch_size, hidden_dim]
-        return x  # [batch_size, hidden_dim]
+        return x  # [batch_size, hidden_dim=128]
 
 class LFModel(nn.Module):
     def __init__(
@@ -467,7 +463,7 @@ class LFModel(nn.Module):
             channel_output = layer['channel_mixer'](x_inner, adapt_input_inner)  # [batch_size, 256]
             moe_output = layer['moe'](x_inner, adapt_input_inner)  # [batch_size, 128]
             attention_output = self.longformer(x_inner)[0].mean(dim=1)  # [batch_size, 768]
-            component_outputs = [token_output, channel_output, moe_output, attention_output]
+            component_outputs = [token_output, channel_output, moe_output, attention_output]  # [256, 256, 128, 768]
             combined_output = layer['combiner'](component_outputs)  # [batch_size, 1408]
             return combined_output
         return checkpoint_utils.checkpoint(custom_forward, x, adapt_input)
@@ -640,9 +636,9 @@ def train_model_meta(
             support_batch = flickr_batch
             query_batch = chat_batch
             # Use embeddings instead of tokens
-            support_inputs = support_batch['embeddings'].to(device)  # [batch_size, seq_length, embedding_dim=256]
+            support_inputs = support_batch['embeddings'].to(device)  # [batch_size, seq_length, 256]
             support_targets = support_batch['tokens'][:, 1:].contiguous().to(device)  # [batch_size, seq_length -1]
-            query_inputs = query_batch['embeddings'].to(device)  # [batch_size, seq_length, embedding_dim=256]
+            query_inputs = query_batch['embeddings'].to(device)  # [batch_size, seq_length, 256]
             query_targets = query_batch['tokens'][:, 1:].contiguous().to(device)  # [batch_size, seq_length -1]
             if scaler:
                 with autocast():
@@ -706,7 +702,7 @@ def generate_response_api(
     with torch.no_grad():
         conversation_history = "User: " + user_text + "\nAssistant:"
         tokenized = tokenizer.text_tokenizer.tokenize(conversation_history)
-        embeddings = tokenized['embeddings'].unsqueeze(0).to(device)  # [1, seq_length, embedding_dim=256]
+        embeddings = tokenized['embeddings'].unsqueeze(0).to(device)  # [1, seq_length, 256]
         tokens = embeddings  # [1, seq_length, 256]
         for _ in range(max_new_tokens):
             with autocast(enabled=(device.type == 'cuda')):
@@ -858,7 +854,7 @@ def main():
                         if (step + 1) % args.accumulation_steps == 0:
                             scaler.step(optimizer)
                             scaler.update()
-                            optimizer.zero_grad()
+                            meta_learner.meta_optimizer.zero_grad()
                     else:
                         outputs = model(support_inputs, image_embeddings=None)
                         loss = criterion(outputs["token_logits"], support_targets)
@@ -900,14 +896,14 @@ def main():
         iface = gr.Interface(
             fn=generate_response_gradio,
             inputs=[
-                gr.inputs.Textbox(lines=2, placeholder="Enter your message here...")
+                gr.inputs.Textbox(lines=2, placeholder="Введите ваше сообщение здесь...")
             ],
             outputs="text",
             title="XlinxChatModel Chatbot",
-            description="A chatbot with AGI capabilities, advanced reasoning, and self-regulation.",
+            description="Чат-бот с возможностями AGI, продвинутым рассуждением и саморегуляцией.",
             examples=[
-                ["Hello, how are you?"],
-                ["Tell me a story about AI."]
+                ["Привет, как дела?"],
+                ["Расскажи мне историю об искусственном интеллекте."]
             ],
             live=False
         )
