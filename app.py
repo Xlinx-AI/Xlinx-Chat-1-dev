@@ -621,9 +621,10 @@ def train_model_meta(
                 break
             support_batch = flickr_batch
             query_batch = chat_batch
-            support_inputs = support_batch['tokens']
+            # Use embeddings instead of tokens
+            support_inputs = support_batch['embeddings']
             support_targets = support_batch['tokens'][:, 1:].contiguous()
-            query_inputs = query_batch['tokens']
+            query_inputs = query_batch['embeddings']
             query_targets = query_batch['tokens'][:, 1:].contiguous()
             if scaler:
                 with autocast():
@@ -671,12 +672,13 @@ def train_model_meta(
         writer.add_scalar('Learning Rate', meta_learner.meta_optimizer.param_groups[0]['lr'], epoch)
     writer.close()
 
+
 def generate_response_api(
     model: 'XlinxChatModel',
     tokenizer: 'LiquidFoundationTokenizer',
     user_text: str,
     session_id: str,
-    max_new_tokens: int = 50,
+    max_new_tokens: int = 500000,
     temperature: float = 1.0,
     top_k: int = 50,
     top_p: float = 0.95
@@ -686,7 +688,8 @@ def generate_response_api(
     with torch.no_grad():
         conversation_history = "User: " + user_text + "\nAssistant:"
         tokenized = tokenizer.text_tokenizer.tokenize(conversation_history)
-        tokens = tokenized['tokens'].unsqueeze(0).to(device)
+        embeddings = tokenized['embeddings'].to(device)  # Use embeddings
+        tokens = embeddings  # Assuming model expects embeddings
         for _ in range(max_new_tokens):
             with autocast(enabled=(device.type == 'cuda')):
                 outputs = model(tokens, image_embeddings=None)
@@ -703,12 +706,13 @@ def generate_response_api(
                 next_token = torch.multinomial(probabilities, num_samples=1)
                 token_str = tokenizer.text_tokenizer.detokenize(next_token.squeeze(0))
                 conversation_history += token_str
-                tokens = torch.cat([tokens, next_token.to(device)], dim=1)
+                embeddings = torch.cat([embeddings, next_token.float().to(device)], dim=1)  # Ensure embeddings are updated correctly
                 generated_tokens.append(token_str)
                 if tokenizer.encoder.eos_token_id and next_token.item() == tokenizer.encoder.eos_token_id:
                     break
     response_text = ''.join(generated_tokens).strip()
     return response_text
+
 
 def generate_response_gradio(user_text):
     assistant_reply = generate_response_api(
