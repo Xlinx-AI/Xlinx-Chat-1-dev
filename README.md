@@ -1,495 +1,264 @@
-# OmniModalLLM
+# LFByteTransformer
 
-OmniModalLLM is a versatile and powerful multimodal language model designed to handle both text and image inputs, enabling sophisticated conversational AI applications similar to ChatGPT. Leveraging advanced architectures like Mixture of Experts (MoE) and Vector Quantized Variational Autoencoders (VQVAE), OmniModalLLM offers robust performance and adaptability across various tasks.
+## Overview / Обзор
 
-## Features
+**English**
 
-- **Multimodal Support:** Handles both text and image data seamlessly.
-- **Mixture of Experts (MoE):** Enhances model performance by leveraging multiple specialized experts.
-- **Vector Quantized VAE (VQVAE):** Efficiently tokenizes and reconstructs images.
-- **Dynamic Configuration:** Adjusts model components dynamically based on input data.
-- **Chat API:** Provides a ChatGPT-like conversational interface using FastAPI.
-- **Memory Optimizations:** Implements techniques like gradient checkpointing and mixed precision training to prevent CUDA Out-Of-Memory (OOM) errors.
-- **Rate Limiting:** Protects the API from abuse using `slowapi`.
-- **Dynamic Response Generation Loop:** Enables the assistant to generate responses of arbitrary length by iteratively predicting tokens until an end-of-sequence token is encountered or a maximum token limit is reached.
+LFByteTransformer is a custom Language Model (LLM) architecture that combines adaptive linear layers, token mixing, channel mixing, and a Mixture of Experts (MoE) module. It operates on byte-level input, allowing it to handle any type of data that can be represented as bytes, such as text, images, audio, and more. This repository provides the implementation of LFByteTransformer, training scripts, and an inference script using Gradio for easy interaction.
 
-## Table of Contents
+**Русский**
 
-- [Installation](#installation)
-- [Usage](#usage)
-  - [Training](#training)
-  - [API Deployment](#api-deployment)
-- [API Endpoints](#api-endpoints)
-- [Examples](#examples)
-- [Contributing](#contributing)
-- [License](#license)
-
-## Installation
-
-### Prerequisites
-
-- Python 3.8 or higher
-- Git
-- CUDA-enabled GPU (optional, for training and inference acceleration)
-
-### Clone the Repository
-
-```bash
-git clone https://github.com/kirill670/OmniModalLLM.git
-cd OmniModalLLM
-```
-
-### Create a Virtual Environment
-
-It's recommended to use a virtual environment to manage dependencies.
-
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-```
-
-### Install Dependencies
-
-```bash
-pip install --upgrade pip
-pip install torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cu116
-pip install transformers datasets pillow fastapi uvicorn tiktoken einops tensorboard faiss-cpu slowapi
-```
-
-*Note:* If you're using a TPU or CPU, adjust the PyTorch installation accordingly.
-
-## Usage
-
-### Training
-
-OmniModalLLM is pre-configured to train on the Flickr30k and DailyDialog datasets. Ensure you have sufficient computational resources before initiating training.
-
-```bash
-python training_script.py
-```
-
-This command will:
-
-1. Load and preprocess the Flickr30k and DailyDialog datasets.
-2. Initialize the OmniModalLLM model and tokenizer.
-3. Start the training loop with mixed precision and gradient checkpointing.
-4. Save model checkpoints upon improvement.
-5. Launch the FastAPI server concurrently.
-
-*Training Parameters:*
-
-- **Epochs:** 5
-- **Batch Size:** Adjusted based on available device (GPU, TPU, CPU)
-- **Learning Rate:** 1e-4
-- **Early Stopping:** Triggered after 3 epochs without improvement
-
-### API Deployment
-
-The FastAPI server provides a `/chat/` endpoint for interactive conversations. Once the training completes, the API server will be accessible at `http://0.0.0.0:8000/chat/`.
-
-#### Running the API Server Independently
-
-If you wish to run the API server without training, ensure the model is trained and load the saved checkpoint.
-
-```bash
-python api_server.py
-```
-
-This command will:
-
-1. Load the trained OmniModalLLM model and tokenizer.
-2. Start the FastAPI server listening on `http://0.0.0.0:8000`.
-3. Expose the `/chat/` endpoint for interactive chat.
-
-## API Endpoints
-
-### POST `/chat/`
-
-Generates a response based on the provided chat messages.
-
-**Request Body:**
-
-```json
-{
-  "session_id": "optional-session-id",
-  "messages": [
-    {
-      "role": "user",
-      "content": "Hello, how are you?"
-    }
-  ]
-}
-```
-
-- **`session_id`** (optional): Unique identifier to maintain conversation context across multiple requests. If not provided, a new session will be created.
-- **`messages`**: List of message objects containing the role (`user`, `assistant`, or `system`) and the content.
-
-**Response:**
-
-```json
-{
-  "session_id": "unique-session-id",
-  "message": {
-    "role": "assistant",
-    "content": "I'm a model designed to assist you. How can I help today?"
-  }
-}
-```
-
-## Examples
-
-### Using `curl`
-
-**Initial Request (Start a New Session):**
-
-```bash
-curl -X POST "http://localhost:8000/chat/" \
--H "Content-Type: application/json" \
--d '{
-    "messages": [
-        {"role": "user", "content": "Hello, how are you?"}
-    ]
-}'
-```
-
-**Response:**
-
-```json
-{
-  "session_id": "generated-session-id",
-  "message": {
-    "role": "assistant",
-    "content": "I'm doing well, thank you! How can I assist you today?"
-  }
-}
-```
-
-**Subsequent Request (Continue the Conversation):**
-
-```bash
-curl -X POST "http://localhost:8000/chat/" \
--H "Content-Type: application/json" \
--d '{
-    "session_id": "existing-session-id",
-    "messages": [
-        {"role": "user", "content": "Can you tell me a joke?"}
-    ]
-}'
-```
-
-**Response:**
-
-```json
-{
-  "session_id": "existing-session-id",
-  "message": {
-    "role": "assistant",
-    "content": "Sure! Why did the computer show up at work late? It had a hard drive!"
-  }
-}
-```
-
-### Using Postman
-
-1. **Create a New POST Request:**
-   - URL: `http://localhost:8000/chat/`
-   
-2. **Set Headers:**
-   - `Content-Type`: `application/json`
-   
-3. **Set Body:**
-   - Choose `raw` and `JSON` format.
-   - Input the JSON payload as shown in the `curl` examples.
-   
-4. **Send the Request:**
-   - Observe the assistant's reply in the response section.
-
-### Creating a Simple Frontend
-
-For a more interactive experience, consider creating a simple frontend using frameworks like React, Vue, or even plain HTML/CSS/JavaScript. This frontend can interact with the FastAPI backend via the `/chat/` endpoint, allowing users to engage in conversations with the assistant through a web interface.
-
-## Contributing
-
-Contributions are welcome! Please follow these steps:
-
-1. Fork the repository.
-2. Create a new branch (`git checkout -b feature/YourFeature`).
-3. Commit your changes (`git commit -m 'Add some feature'`).
-4. Push to the branch (`git push origin feature/YourFeature`).
-5. Open a Pull Request.
-
-Please ensure your code adheres to the project's coding standards and includes appropriate tests.
-
-## License
-
-This project is licensed under the [MIT License](LICENSE).
+LFByteTransformer — это пользовательская архитектура языковой модели (LLM), которая сочетает в себе адаптивные линейные слои, перемешивание токенов, перемешивание каналов и модуль Mixture of Experts (MoE). Она работает на уровне байтов, что позволяет обрабатывать любые данные, представимые в виде байтов, такие как текст, изображения, аудио и многое другое. Этот репозиторий предоставляет реализацию LFByteTransformer, скрипты для обучения и скрипт инференса с использованием Gradio для удобного взаимодействия.
 
 ---
 
-## Russian Version
+## Table of Contents / Содержание
 
-# OmniModalLLM
-
-OmniModalLLM — это универсальная и мощная мультимодальная языковая модель, разработанная для обработки как текстовых, так и изображенческих данных. Она позволяет создавать сложные приложения для разговорного ИИ, аналогичные ChatGPT. Используя передовые архитектуры, такие как Mixture of Experts (MoE) и Vector Quantized Variational Autoencoders (VQVAE), OmniModalLLM обеспечивает высокую производительность и адаптивность для различных задач.
-
-## Особенности
-
-- **Мультимодальная поддержка:** Бесшовно обрабатывает как текстовые, так и изображенческие данные.
-- **Mixture of Experts (MoE):** Улучшает производительность модели за счет использования нескольких специализированных экспертов.
-- **Vector Quantized VAE (VQVAE):** Эффективно токенизирует и восстанавливает изображения.
-- **Динамическая конфигурация:** Настраивает компоненты модели динамически на основе входных данных.
-- **Чат API:** Предоставляет интерфейс для разговоров, похожий на ChatGPT, используя FastAPI.
-- **Оптимизация памяти:** Реализует такие методы, как градиентный чекпоинтинг и обучение с смешанной точностью, чтобы избежать ошибок Out-Of-Memory (OOM) на CUDA.
-- **Ограничение скорости запросов:** Защищает API от злоупотреблений с помощью `slowapi`.
-- **Динамический цикл генерации ответов:** Позволяет ассистенту генерировать ответы произвольной длины, итеративно предсказывая токены до появления токена конца последовательности или достижения максимального лимита токенов.
-
-## Содержание
-
-- [Установка](#установка)
-- [Использование](#использование)
-  - [Обучение](#обучение)
-  - [Развертывание API](#развертывание-api)
-- [API Эндпоинты](#api-эндпоинты)
-- [Примеры](#примеры)
-- [Вклад](#вклад)
-- [Лицензия](#лицензия)
-
-## Установка
-
-### Предварительные требования
-
-- Python 3.8 или выше
-- Git
-- CUDA-совместимый GPU (опционально, для ускорения обучения и инференса)
-
-### Клонирование репозитория
-
-```bash
-git clone https://github.com/kirill670/OmniModalLLM.git
-cd OmniModalLLM
-```
-
-### Создание виртуального окружения
-
-Рекомендуется использовать виртуальное окружение для управления зависимостями.
-
-```bash
-python -m venv venv
-source venv/bin/activate  # В Windows: venv\Scripts\activate
-```
-
-### Установка зависимостей
-
-```bash
-pip install --upgrade pip
-pip install torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cu116
-pip install transformers datasets pillow fastapi uvicorn tiktoken einops tensorboard faiss-cpu slowapi
-```
-
-*Примечание:* Если вы используете TPU или CPU, настройте установку PyTorch соответствующим образом.
-
-## Использование
-
-### Обучение
-
-OmniModalLLM преднастроена для обучения на датасетах Flickr30k и DailyDialog. Убедитесь, что у вас есть достаточные вычислительные ресурсы перед началом обучения.
-
-```bash
-python training_script.py
-```
-
-Эта команда выполнит следующие действия:
-
-1. Загрузит и предварительно обработает датасеты Flickr30k и DailyDialog.
-2. Инициализирует модель OmniModalLLM и токенизатор.
-3. Запустит цикл обучения с использованием смешанной точности и градиентного чекпоинтинга.
-4. Сохранит чекпоинты модели при улучшении результатов.
-5. Одновременно запустит сервер FastAPI.
-
-*Параметры обучения:*
-
-- **Эпохи:** 5
-- **Размер батча:** Настраивается в зависимости от доступного устройства (GPU, TPU, CPU)
-- **Скорость обучения:** 1e-4
-- **Ранняя остановка:** Активируется после 3 эпох без улучшения
-
-### Развертывание API
-
-Сервер FastAPI предоставляет эндпоинт `/chat/` для интерактивных разговоров. После завершения обучения API-сервер будет доступен по адресу `http://0.0.0.0:8000/chat/`.
-
-#### Запуск API-сервера отдельно
-
-Если вы хотите запустить API-сервер без обучения, убедитесь, что модель обучена и загрузите сохраненный чекпоинт.
-
-```bash
-python api_server.py
-```
-
-Эта команда выполнит следующие действия:
-
-1. Загрузит обученную модель OmniModalLLM и токенизатор.
-2. Запустит сервер FastAPI, слушающий на `http://0.0.0.0:8000`.
-3. Предоставит эндпоинт `/chat/` для интерактивного чата.
-
-## API Эндпоинты
-
-### POST `/chat/`
-
-Генерирует ответ на основе предоставленных сообщений чата.
-
-**Тело запроса:**
-
-```json
-{
-  "session_id": "optional-session-id",
-  "messages": [
-    {
-      "role": "user",
-      "content": "Привет, как дела?"
-    }
-  ]
-}
-```
-
-- **`session_id`** (опционально): Уникальный идентификатор для поддержания контекста разговора между несколькими запросами. Если не предоставлен, будет создана новая сессия.
-- **`messages`**: Список объектов сообщений, содержащих роль (`user`, `assistant` или `system`) и содержимое.
-
-**Ответ:**
-
-```json
-{
-  "session_id": "unique-session-id",
-  "message": {
-    "role": "assistant",
-    "content": "Я модель, созданная для помощи вам. Чем могу помочь сегодня?"
-  }
-}
-```
-
-## Примеры
-
-### Использование `curl`
-
-**Начальный запрос (Создание новой сессии):**
-
-```bash
-curl -X POST "http://localhost:8000/chat/" \
--H "Content-Type: application/json" \
--d '{
-    "messages": [
-        {"role": "user", "content": "Привет, как дела?"}
-    ]
-}'
-```
-
-**Ответ:**
-
-```json
-{
-  "session_id": "generated-session-id",
-  "message": {
-    "role": "assistant",
-    "content": "Я делаю хорошо, спасибо! Чем могу помочь вам сегодня?"
-  }
-}
-```
-
-**Последующий запрос (Продолжение разговора):**
-
-```bash
-curl -X POST "http://localhost:8000/chat/" \
--H "Content-Type: application/json" \
--d '{
-    "session_id": "existing-session-id",
-    "messages": [
-        {"role": "user", "content": "Расскажи анекдот."}
-    ]
-}'
-```
-
-**Ответ:**
-
-```json
-{
-  "session_id": "existing-session-id",
-  "message": {
-    "role": "assistant",
-    "content": "Конечно! Почему компьютер опоздал на работу? Потому что у него был жесткий диск!"
-  }
-}
-```
-
-### Использование Postman
-
-1. **Создайте новый POST-запрос:**
-   - URL: `http://localhost:8000/chat/`
-   
-2. **Установите заголовки:**
-   - `Content-Type`: `application/json`
-   
-3. **Установите тело запроса:**
-   - Выберите `raw` и формат `JSON`.
-   - Введите JSON-пейлоад, как показано в примерах `curl`.
-   
-4. **Отправьте запрос:**
-   - Наблюдайте ответ ассистента в разделе ответа.
-
-### Создание простого фронтенда
-
-Для более интерактивного опыта рассмотрите возможность создания простого фронтенда с использованием таких фреймворков, как React, Vue или даже простого HTML/CSS/JavaScript. Этот фронтенд может взаимодействовать с бэкендом FastAPI через эндпоинт `/chat/`, позволяя пользователям вести диалог с ассистентом через веб-интерфейс.
-
-## Вклад
-
-Вклады приветствуются! Пожалуйста, следуйте этим шагам:
-
-1. Форкните репозиторий.
-2. Создайте новую ветку (`git checkout -b feature/YourFeature`).
-3. Закоммитьте свои изменения (`git commit -m 'Добавить некоторую функцию'`).
-4. Запушьте в ветку (`git push origin feature/YourFeature`).
-5. Откройте Pull Request.
-
-Пожалуйста, убедитесь, что ваш код соответствует стандартам кодирования проекта и включает соответствующие тесты.
-
-## Лицензия
-
-Этот проект лицензирован под [MIT License](LICENSE).
+- [Features / Особенности](#features--особенности)
+- [Usage / Использование](#usage--использование)
+  - [Training / Обучение](#training--обучение)
+  - [Inference / Инференс](#inference--инференс)
+- [Model Architecture / Архитектура модели](#model-architecture--архитектура-модели)
+- [Examples / Примеры](#examples--примеры)
+- [Contributing / Вклад](#contributing--вклад)
+- [License / Лицензия](#license--лицензия)
 
 ---
 
-## Additional Information
+## Features / Особенности
 
-For further assistance, questions, or suggestions, please feel free to open an issue on the [GitHub repository](https://github.com/kirill670/OmniModalLLM/issues).
+**English**
+
+- Byte-level language model capable of handling diverse data types.
+- Adaptive Linear layers that adjust weights based on the input.
+- Token Mixing and Channel Mixing layers for enhanced feature interactions.
+- Mixture of Experts module for dynamic expert selection.
+- Supports distributed training with mixed precision for performance optimization.
+- Gradio-based inference script for easy interaction and testing.
+
+**Русский**
+
+- Языковая модель на уровне байтов, способная обрабатывать различные типы данных.
+- Адаптивные линейные слои, настраивающие веса на основе входных данных.
+- Слои перемешивания токенов и каналов для улучшения взаимодействия признаков.
+- Модуль Mixture of Experts для динамического выбора экспертов.
+- Поддержка распределенного обучения со смешанной точностью для оптимизации производительности.
+- Скрипт инференса на базе Gradio для удобного взаимодействия и тестирования.
 
 ---
 
-## Summary of Critical Additions and Corrections:
+## Usage / Использование
 
-1. **Dynamic Response Generation Loop in API Server:**
-   - **Purpose:** Allows the assistant to generate responses of arbitrary length by iteratively predicting the next token until an end-of-sequence token is generated or a maximum number of tokens is reached.
-   - **Implementation:** Added a loop in the `generate_response_api` function within the `api_server.py` script that handles token generation, temperature scaling, top-k and top-p sampling, and termination conditions.
+### Training / Обучение
 
-2. **Updated Features Section:**
-   - Included the **Dynamic Response Generation Loop** to highlight the model's capability to generate extensive and coherent responses.
+**English**
 
-3. **Usage Instructions:**
-   - Enhanced the **API Deployment** section to explain the independent running of the API server and its functionalities.
-   - Updated the **Examples** section to reflect the ability to handle extended conversations and generate longer responses.
+To train the LFByteTransformer model, you can use the provided `train.py` script. The training script supports distributed training with mixed precision and gradient accumulation.
 
-4. **Concurrency and Thread Safety:**
-   - Ensured that the conversation history management in the API server is thread-safe using `threading.Lock` to prevent race conditions during concurrent access.
+**Example Command:**
 
-5. **Rate Limiting:**
-   - Implemented rate limiting using `slowapi` to protect the API from abuse, with configurable request limits.
+```bash
+torchrun --nproc_per_node=2 train.py \
+    --distributed \
+    --epochs 10 \
+    --batch_size 8 \
+    --accumulation_steps 4 \
+    --seq_len 256 \
+    --embed_dim 512 \
+    --num_layers 8 \
+    --adapt_dim 512 \
+    --num_experts 4 \
+    --lr 3e-4 \
+    --max_grad_norm 1.0 \
+    --dropout 0.1 \
+    --save_path "./checkpoints"
+```
 
-6. **Error Handling Enhancements:**
-   - Added checks to handle scenarios where user messages are not provided, ensuring the assistant responds appropriately.
+**Русский**
 
-7. **Device Compatibility:**
-   - Ensured that all tensors are correctly moved to the designated device (`CPU`, `GPU`, or `TPU`) to prevent device mismatch errors during training and inference.
+Для обучения модели LFByteTransformer вы можете использовать предоставленный скрипт `train.py`. Скрипт обучения поддерживает распределенное обучение со смешанной точностью и накоплением градиентов.
 
-8. **Documentation Improvements:**
-   - Provided detailed instructions for setting up, training, and deploying the model.
-   - Included examples for using both `curl` and Postman to interact with the API.
-   - Suggested creating a frontend for enhanced user interaction.
+**Пример команды:**
 
-By incorporating these updates, the **OmniModalLLM** project now offers a more robust and flexible framework for developing advanced multimodal conversational AI applications.
+```bash
+torchrun --nproc_per_node=2 train.py \
+    --distributed \
+    --epochs 10 \
+    --batch_size 8 \
+    --accumulation_steps 4 \
+    --seq_len 256 \
+    --embed_dim 512 \
+    --num_layers 8 \
+    --adapt_dim 512 \
+    --num_experts 4 \
+    --lr 3e-4 \
+    --max_grad_norm 1.0 \
+    --dropout 0.1 \
+    --save_path "./checkpoints"
+```
+
+#### Command Arguments / Аргументы команды
+
+- `--distributed`: Enable DistributedDataParallel (DDP) training.
+- `--epochs`: Number of training epochs.
+- `--batch_size`: Batch size per GPU.
+- `--accumulation_steps`: Number of gradient accumulation steps.
+- `--seq_len`: Sequence length for input data.
+- `--embed_dim`: Embedding dimension.
+- `--num_layers`: Number of LFModel layers.
+- `--adapt_dim`: Adaptation dimension.
+- `--num_experts`: Number of experts in MoE module.
+- `--lr`: Learning rate.
+- `--max_grad_norm`: Max gradient norm for gradient clipping.
+- `--dropout`: Dropout rate.
+- `--save_path`: Path to save model checkpoints.
+
+**Note:** Adjust the parameters based on your hardware capabilities.
+
+**Русский**
+
+#### Описание аргументов
+
+- `--distributed`: Включает распределенное обучение с использованием DDP.
+- `--epochs`: Количество эпох обучения.
+- `--batch_size`: Размер батча на один GPU.
+- `--accumulation_steps`: Количество шагов накопления градиентов.
+- `--seq_len`: Длина входной последовательности.
+- `--embed_dim`: Размерность эмбеддингов.
+- `--num_layers`: Количество слоев LFModel.
+- `--adapt_dim`: Размерность адаптации.
+- `--num_experts`: Число экспертов в модуле MoE.
+- `--lr`: Скорость обучения.
+- `--max_grad_norm`: Максимальная норма градиента для клиппинга.
+- `--dropout`: Вероятность дропаут.
+- `--save_path`: Путь для сохранения контрольных точек модели.
+
+**Примечание:** Настройте параметры в соответствии с возможностями вашего оборудования.
+
+### Inference / Инференс
+
+**English**
+
+An inference script using Gradio is provided for easy interaction with the trained model. You can generate text by providing a starting sequence.
+
+**Run the inference script:**
+
+```bash
+python app.py
+```
+
+**Русский**
+
+Для удобного взаимодействия с обученной моделью предоставлен скрипт инференса с использованием Gradio. Вы можете генерировать текст, предоставляя начальную последовательность.
+
+**Запустите скрипт инференса:**
+
+```bash
+python inference.py
+```
+
+#### Using the Gradio Interface / Использование интерфейса Gradio
+
+1. After running the script, a Gradio web interface will open in your browser.
+2. Enter the starting text in the input box.
+3. Adjust the `Max Length` and `Temperature` sliders as needed.
+4. Click the "Submit" button to generate text.
+
+**Русский**
+
+1. После запуска скрипта в вашем браузере откроется веб-интерфейс Gradio.
+2. Введите начальный текст в поле ввода.
+3. При необходимости настройте ползунки `Max Length` и `Temperature`.
+4. Нажмите кнопку "Submit" для генерации текста.
+
+---
+
+## Model Architecture / Архитектура модели
+
+**English**
+
+The LFByteTransformer model integrates several advanced components:
+
+- **AdaptiveLinear**: Linear layers that adapt their weights based on the input.
+- **TokenMixing**: Mixes token representations to capture interactions across the sequence.
+- **ChannelMixing**: Mixes channel (feature) representations to enhance feature interactions.
+- **MixtureOfExperts (MoE)**: Dynamically selects expert networks based on the input.
+- **PositionalEncoding**: Adds positional information to the byte embeddings.
+
+**Русский**
+
+Модель LFByteTransformer включает несколько продвинутых компонентов:
+
+- **AdaptiveLinear**: Линейные слои, адаптирующие свои веса на основе входных данных.
+- **TokenMixing**: Перемешивает представления токенов для захвата взаимодействий в последовательности.
+- **ChannelMixing**: Перемешивает представления каналов (признаков) для улучшения взаимодействия признаков.
+- **MixtureOfExperts (MoE)**: Динамически выбирает экспертные сети на основе входных данных.
+- **PositionalEncoding**: Добавляет позиционную информацию к эмбеддингам байтов.
+
+---
+
+## Examples / Примеры
+
+**English**
+
+Here's how you can generate text using the model:
+
+```python
+from train import LFByteTransformer
+import torch
+
+# Load the trained model
+model = LFByteTransformer()
+checkpoint = torch.load('checkpoints/model_epoch_9.pth')
+model.load_state_dict(checkpoint['model_state_dict'])
+model.eval()
+
+# Generate text
+start_sequence = "Once upon a time"
+generated_text = generate_text(model, start_sequence, max_length=100)
+print("Generated text:", generated_text)
+```
+
+**Русский**
+
+Вот как вы можете сгенерировать текст с помощью модели:
+
+```python
+from train import LFByteTransformer
+import torch
+
+# Загрузите обученную модель
+model = LFByteTransformer()
+checkpoint = torch.load('checkpoints/model_epoch_9.pth')
+model.load_state_dict(checkpoint['model_state_dict'])
+model.eval()
+
+# Генерация текста
+start_sequence = "Жили-были"
+generated_text = generate_text(model, start_sequence, max_length=100)
+print("Сгенерированный текст:", generated_text)
+```
+
+---
+
+## Contributing / Вклад
+
+**English**
+
+Contributions are welcome! Please open issues or pull requests for any improvements or bug fixes.
+
+**Русский**
+
+Мы приветствуем вклад сообщества! Пожалуйста, открывайте issues или pull requests для любых улучшений или исправлений.
+
+---
+
+## License / Лицензия
+
+This project is licensed under the MIT License.
+
+**Русский**
+
+Этот проект лицензирован под лицензией MIT.
+
+---
