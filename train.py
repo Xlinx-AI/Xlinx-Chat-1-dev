@@ -11,7 +11,6 @@ from torch.utils.tensorboard import SummaryWriter
 import argparse
 import gradio as gr
 import higher
-import pandas as pd
 from tqdm import tqdm
 import diskcache as dc
 from datasets import load_dataset
@@ -23,6 +22,7 @@ from typing import Any, Dict, List, Optional
 import torch.utils.checkpoint as checkpoint_utils
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+VQ_LOSS_WEIGHT = 0.1
 
 def initialize_weights(module: nn.Module):
     if isinstance(module, nn.Linear):
@@ -41,6 +41,12 @@ def initialize_weights(module: nn.Module):
     elif isinstance(module, (nn.LayerNorm, nn.GroupNorm, nn.InstanceNorm1d)):
         nn.init.ones_(module.weight)
         nn.init.zeros_(module.bias)
+
+
+def sequence_cross_entropy(logits: torch.Tensor, targets: torch.Tensor, criterion: nn.Module) -> torch.Tensor:
+    """Compute token-level cross entropy for batched sequences."""
+    vocab_size = logits.size(-1)
+    return criterion(logits.view(-1, vocab_size), targets.reshape(-1))
 
 class DropPath(nn.Module):
     def __init__(self, drop_prob: float = 0.0):
@@ -65,12 +71,18 @@ class DropBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.training or self.drop_prob == 0.0:
             return x
-        gamma = self.drop_prob / (self.block_size ** 2)
+        if x.ndim < 4:
+            # Fallback to standard dropout for non-spatial tensors
+            return F.dropout(x, p=self.drop_prob, training=self.training)
+        gamma = self.drop_prob / float(self.block_size ** 2)
         mask = (torch.rand_like(x) < gamma).float()
-        mask = F.max_pool2d(mask, kernel_size=self.block_size, stride=1, padding=self.block_size//2)
+        mask = F.max_pool2d(mask, kernel_size=self.block_size, stride=1, padding=self.block_size // 2)
         mask = 1 - (mask > 0).float()
+        valid = mask.sum()
+        if valid == 0:
+            return x
         count = mask.numel() / mask.shape[0]
-        return x * mask * (count / mask.sum())
+        return x * mask * (count / valid)
 
 class LayerDrop(nn.Module):
     def __init__(self, drop_prob: float = 0.0):
@@ -244,35 +256,36 @@ class VQVAE(nn.Module):
     def __init__(self, num_embeddings: int = 512, embedding_dim: int = 256, commitment_cost: float = 0.25):
         super(VQVAE, self).__init__()
         # Encoder: Input_dim=128 (from SemanticModule's text_mean)
-        self.encoder = nn.Sequential(
-            LiquidLinear(128, 64, adapt_dim=64),
-            nn.ReLU(),
-            LiquidLinear(64, 128, adapt_dim=64),
-            nn.ReLU(),
-            LiquidLinear(128, embedding_dim, adapt_dim=64)
-        )
+        self.enc1 = nn.Linear(128, 256)
+        self.enc2 = nn.Linear(256, 512)
+        self.enc3 = nn.Linear(512, embedding_dim)
         self.vq_layer = VectorQuantizer(num_embeddings, embedding_dim, commitment_cost)
         # Decoder: Output_dim=128
-        self.decoder = nn.Sequential(
-            LiquidLinear(embedding_dim, 128, adapt_dim=64),
-            nn.ReLU(),
-            LiquidLinear(128, 64, adapt_dim=64),
-            nn.ReLU(),
-            LiquidLinear(64, 128, adapt_dim=64),
-            nn.Sigmoid()
-        )
+        self.dec1 = nn.Linear(embedding_dim, 512)
+        self.dec2 = nn.Linear(512, 256)
+        self.dec3 = nn.Linear(256, 128)
         self.apply(initialize_weights)
 
     def forward(self, x: torch.Tensor, adapt_input: torch.Tensor = None):
-        if adapt_input is None:
-            adapt_input = torch.zeros(x.size(0), 64).to(x.device)
         # Ensure x is 2D [batch_size, 128]
-        if x.dim() != 2:
-            raise ValueError(f"Expected x to have 2 dimensions, got {x.dim()} dimensions.")
-        z_e = self.encoder(x, adapt_input)  # [batch_size, embedding_dim=256]
+        if x.dim() == 3:
+            x = x.mean(dim=1)  # [batch_size, 128]
+        elif x.dim() != 2:
+            raise ValueError(f"Expected x to have 2 or 3 dimensions, got {x.dim()} dimensions.")
+        
+        # Encoder
+        z_e = F.relu(self.enc1(x))
+        z_e = F.relu(self.enc2(z_e))
+        z_e = self.enc3(z_e)  # [batch_size, embedding_dim=256]
+        
         vq_outputs = self.vq_layer(z_e)  # Quantized tensor and losses
         z_q = vq_outputs["quantized"]  # [batch_size, 256]
-        x_recon = self.decoder(z_q, adapt_input)  # [batch_size, 128]
+        
+        # Decoder
+        x_recon = F.relu(self.dec1(z_q))
+        x_recon = F.relu(self.dec2(x_recon))
+        x_recon = torch.sigmoid(self.dec3(x_recon))  # [batch_size, 128]
+        
         return {
             "quantized": z_q,  # [batch_size, 256]
             "vq_loss": vq_outputs["vq_loss"],
@@ -501,6 +514,12 @@ class LFModel(nn.Module):
             param.requires_grad = False
         self.dropblock = DropBlock(block_size=dropblock_block_size, drop_prob=dropblock_prob)
         self.layers = nn.ModuleList()
+        # Projection layers for Longformer integration
+        self.longformer_proj = nn.Linear(token_dim, 768)
+        self.longformer_out_proj = nn.Linear(768, token_dim)
+        self.longformer_proj.apply(initialize_weights)
+        self.longformer_out_proj.apply(initialize_weights)
+        
         for i in range(num_layers):
             drop_prob = max_drop_prob * float(i) / float(num_layers)
             layer = nn.ModuleDict({
@@ -512,19 +531,23 @@ class LFModel(nn.Module):
                     activation='gelu'
                 ),
                 'combiner': ComponentCombination(
-                    input_dims=[token_dim, channel_dim, expert_dim, self.longformer.config.hidden_size],
+                    input_dims=[token_dim, channel_dim, expert_dim, token_dim],
                     hidden_dim=hidden_dim,
                     dropout_rate=dropout_rate,
                     activation=combination_activation,
                     norm_type=combination_norm_type
                 ),
-                'layerdrop': LayerDrop(layerdrop_prob)
+                'layerdrop': LayerDrop(layerdrop_prob),
+                'output_proj': nn.Linear(token_dim + channel_dim + expert_dim + token_dim, token_dim),
+                'norm': nn.LayerNorm(token_dim)
             })
+            layer['output_proj'].apply(initialize_weights)
+            layer['norm'].apply(initialize_weights)
             self.layers.append(layer)
         self.dynamic_layer_threshold = dynamic_layer_threshold
-        # Projection layer: [combined_features=5120] -> [256]
-        self.output_layer = nn.Linear(5120, 256)
-        self.output_layer.apply(initialize_weights)
+        # Output normalization
+        self.output_norm = nn.LayerNorm(token_dim)
+        self.output_norm.apply(initialize_weights)
 
     def forward(self, x: torch.Tensor, config_weights: Optional[Dict[str, float]] = None) -> torch.Tensor:
         """
@@ -533,7 +556,6 @@ class LFModel(nn.Module):
         Returns:
             [batch_size, seq_length, token_dim=256]
         """
-        adapt_input = self.featurizer(x.mean(dim=1))  # [batch_size, adapt_dim]
         if config_weights is None:
             config_weights = {}
             for i in range(len(self.layers)):
@@ -555,32 +577,53 @@ class LFModel(nn.Module):
                 layer_weight_channel < self.dynamic_layer_threshold and
                 layer_weight_attention < self.dynamic_layer_threshold):
                 continue
-            # Apply layerdrop with processing function
-            x = layer['layerdrop'](x, lambda x_inner: self._process_layer(layer, x_inner, adapt_input))
+            x = layer['layerdrop'](
+                x,
+                lambda x_inner, _layer=layer, _wm=layer_weight_moe,
+                       _wt=layer_weight_token, _wc=layer_weight_channel,
+                       _wa=layer_weight_attention: self._process_layer(
+                    _layer,
+                    x_inner,
+                    _wm,
+                    _wt,
+                    _wc,
+                    _wa,
+                )
+            )
         x = self.dropblock(x)
-        # Apply output_layer to all tokens simultaneously
-        output = self.output_layer(x)  # [batch_size, seq_length, 256]
-        return output
+        return self.output_norm(x)
 
-    def _process_layer(self, layer: nn.ModuleDict, x: torch.Tensor, adapt_input: torch.Tensor) -> torch.Tensor:
+    def _process_layer(
+        self,
+        layer: nn.ModuleDict,
+        x: torch.Tensor,
+        weight_moe: float,
+        weight_token: float,
+        weight_channel: float,
+        weight_attention: float,
+    ) -> torch.Tensor:
         """
         x: [batch_size, seq_length, token_dim=256]
-        adapt_input: [batch_size, adapt_dim]
         Returns:
-            [batch_size, seq_length, combined_features=5120]
+            [batch_size, seq_length, token_dim=256]
         """
-        # Apply LiquidLinear layers
-        token_output = layer['token_mixer'](x, adapt_input)  # [batch_size, seq_length, 256]
-        channel_output = layer['channel_mixer'](x, adapt_input)  # [batch_size, seq_length, 256]
-        moe_output = layer['moe'](x, adapt_input)  # [batch_size, seq_length, 128]
-        # Get attention_output from Longformer
-        longformer_output = self.longformer(x)[0]  # [batch_size, seq_length, hidden_size=4096]
-        attention_output = longformer_output.mean(dim=1)  # [batch_size, hidden_size=4096]
-        attention_output = attention_output.unsqueeze(1).repeat(1, x.size(1), 1)  # [batch_size, seq_length, 4096]
-        # Combine all components
-        component_outputs = [token_output, channel_output, moe_output, attention_output]  # [256, 256, 128, 4096]
-        combined_output = layer['combiner'](component_outputs)  # [batch_size, seq_length, 5120]
-        return combined_output
+        adapt_input = self.featurizer(x.mean(dim=1))  # [batch_size, adapt_dim]
+        token_output = layer['token_mixer'](x, adapt_input) * weight_token
+        channel_output = layer['channel_mixer'](x, adapt_input) * weight_channel
+        moe_output = layer['moe'](x, adapt_input) * weight_moe
+
+        longformer_input = self.longformer_proj(x)
+        attention_mask = torch.ones(x.size(0), x.size(1), dtype=torch.long, device=x.device)
+        longformer_hidden = self.longformer(
+            inputs_embeds=longformer_input,
+            attention_mask=attention_mask
+        ).last_hidden_state
+        longformer_hidden = self.longformer_out_proj(longformer_hidden) * weight_attention
+
+        component_outputs = [token_output, channel_output, moe_output, longformer_hidden]
+        combined_output = layer['combiner'](component_outputs)
+        projected = layer['output_proj'](combined_output)
+        return layer['norm'](x + projected)
 
 class XlinxChatModel(nn.Module):
     def __init__(
@@ -630,9 +673,6 @@ class XlinxChatModel(nn.Module):
             dynamic_layer_threshold=dynamic_layer_threshold
         ).to(device)
         self.liquid_vae = VQVAE(num_embeddings=512, embedding_dim=256, commitment_cost=0.25).to(device)
-        self.liquid_vae.eval()
-        for param in self.liquid_vae.parameters():
-            param.requires_grad = False
         self.adaptive_config = AdaptiveConfiguration(adapt_dim, num_layers).to(device)
         self.semantic_module = SemanticModule(
             input_dim=256,  # token_dim
@@ -671,7 +711,7 @@ class XlinxChatModel(nn.Module):
         config_weights = {key: value for key, value in config.items()}  # Scalars
 
         # Pass through LFModel
-        lf_output = self.lf_model(combined_input, config_weights)  # [batch_size, seq_length, 5120]
+        lf_output = self.lf_model(combined_input, config_weights)  # [batch_size, seq_length, 256]
 
         # Pass through SemanticModule
         semantic_output = self.semantic_module(lf_output, adapt_input)  # [batch_size, seq_length, 128]
@@ -681,7 +721,8 @@ class XlinxChatModel(nn.Module):
         text_mean = text_output.mean(dim=1)  # [batch_size, 128]
 
         # Pass through VQVAE
-        vae_outputs = self.liquid_vae(text_mean)  # Dict with reconstructed, vq_loss, perplexity
+        with torch.no_grad():
+            vae_outputs = self.liquid_vae(text_mean)  # Dict with reconstructed, vq_loss, perplexity
         reconstructed_text = vae_outputs["reconstructed"]  # [batch_size, 128]
 
         # Token prediction
@@ -721,10 +762,11 @@ class XlinxChatModel(nn.Module):
         self.to(device)
 
 class MetaLearner:
-    def __init__(self, model, inner_lr=1e-2, meta_lr=1e-3, device='cuda'):
+    def __init__(self, model, inner_lr=1e-2, meta_lr=1e-3, vq_weight: float = 0.1, device='cuda'):
         self.model = model
         self.inner_lr = inner_lr
         self.meta_lr = meta_lr
+        self.vq_weight = vq_weight
         self.device = device
         self.meta_optimizer = torch.optim.Adam(self.model.parameters(), lr=self.meta_lr)
 
@@ -738,10 +780,22 @@ class MetaLearner:
         self.meta_optimizer.zero_grad()
         with higher.innerloop_ctx(self.model, torch.optim.SGD(self.model.parameters(), lr=self.inner_lr)) as (fmodel, diffopt):
             support_outputs = fmodel(support_inputs, image_embeddings=None)
-            support_loss = criterion(support_outputs["token_logits"], support_targets)
+            support_logits = support_outputs["token_logits"]
+            support_len = min(support_logits.size(1), support_targets.size(1))
+            support_loss = sequence_cross_entropy(
+                support_logits[:, :support_len, :],
+                support_targets[:, :support_len],
+                criterion
+            ) + self.vq_weight * support_outputs["vq_loss"]
             diffopt.step(support_loss)
             query_outputs = fmodel(query_inputs, image_embeddings=None)
-            query_loss = criterion(query_outputs["token_logits"], query_targets)
+            query_logits = query_outputs["token_logits"]
+            query_len = min(query_logits.size(1), query_targets.size(1))
+            query_loss = sequence_cross_entropy(
+                query_logits[:, :query_len, :],
+                query_targets[:, :query_len],
+                criterion
+            ) + self.vq_weight * query_outputs["vq_loss"]
         query_loss.backward()
         self.meta_optimizer.step()
         return support_loss.item(), query_loss.item()
@@ -777,16 +831,34 @@ def train_model_meta(
                 break
             support_batch = flickr_batch
             query_batch = chat_batch
-            # Используем embeddings вместо токенов
-            support_inputs = support_batch['embeddings'].unsqueeze(1).to(device)  # [batch_size, 1, 256]
-            support_targets = support_batch['tokens'][:, 1:].contiguous().to(device)  # [batch_size, seq_length -1]
-            query_inputs = query_batch['embeddings'].unsqueeze(1).to(device)  # [batch_size, 1, 256]
-            query_targets = query_batch['tokens'][:, 1:].contiguous().to(device)  # [batch_size, seq_length -1]
+
+            support_embeddings = support_batch['embeddings'].to(device)
+            support_tokens = support_batch['tokens'].to(device)
+            query_embeddings = query_batch['embeddings'].to(device)
+            query_tokens = query_batch['tokens'].to(device)
+
+            if support_embeddings.size(1) < 2 or query_embeddings.size(1) < 2:
+                continue
+
+            support_inputs = support_embeddings[:, :-1, :]
+            support_targets = support_tokens[:, 1:]
+            query_inputs = query_embeddings[:, :-1, :]
+            query_targets = query_tokens[:, 1:]
+
+            support_len = min(support_inputs.size(1), support_targets.size(1))
+            query_len = min(query_inputs.size(1), query_targets.size(1))
+            support_inputs = support_inputs[:, :support_len, :]
+            support_targets = support_targets[:, :support_len]
+            query_inputs = query_inputs[:, :query_len, :]
+            query_targets = query_targets[:, :query_len]
+
             if scaler:
                 with autocast():
                     support_outputs = model(support_inputs, image_embeddings=None)
-                    support_loss = criterion(support_outputs["token_logits"], support_targets)
-                    support_loss = support_loss / accumulation_steps
+                    support_logits = support_outputs["token_logits"][:, :support_len, :]
+                    language_loss = sequence_cross_entropy(support_logits, support_targets, criterion)
+                    vq_loss = support_outputs["vq_loss"]
+                    support_loss = (language_loss + meta_learner.vq_weight * vq_loss) / accumulation_steps
                 scaler.scale(support_loss).backward()
                 if (step + 1) % accumulation_steps == 0:
                     scaler.step(meta_learner.meta_optimizer)
@@ -794,8 +866,10 @@ def train_model_meta(
                     meta_learner.meta_optimizer.zero_grad()
             else:
                 support_outputs = model(support_inputs, image_embeddings=None)
-                support_loss = criterion(support_outputs["token_logits"], support_targets)
-                support_loss = support_loss / accumulation_steps
+                support_logits = support_outputs["token_logits"][:, :support_len, :]
+                language_loss = sequence_cross_entropy(support_logits, support_targets, criterion)
+                vq_loss = support_outputs["vq_loss"]
+                support_loss = (language_loss + meta_learner.vq_weight * vq_loss) / accumulation_steps
                 support_loss.backward()
                 if (step + 1) % accumulation_steps == 0:
                     meta_learner.meta_optimizer.step()
@@ -947,7 +1021,8 @@ def main():
 
         chat_custom_dataset = ChatIterableDataset(chat_dataset, tokenizer.text_tokenizer, max_length=512)
         chat_dataloader = DataLoader(chat_custom_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
-        criterion = nn.CrossEntropyLoss()
+        pad_token_id = tokenizer.text_tokenizer.pad_token
+        criterion = nn.CrossEntropyLoss(ignore_index=pad_token_id)
         optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, verbose=True)
 
@@ -956,6 +1031,7 @@ def main():
                 model=model,
                 inner_lr=1e-2,
                 meta_lr=args.learning_rate,
+                vq_weight=VQ_LOSS_WEIGHT,
                 device=device
             )
             train_model_meta(
@@ -987,23 +1063,36 @@ def main():
                     except StopIteration:
                         break
                     support_batch = chat_batch
-                    # Используем embeddings вместо токенов
-                    support_inputs = support_batch['embeddings'].unsqueeze(1).to(device)  # [batch_size, 1, 256]
-                    support_targets = support_batch['tokens'][:, 1:].contiguous().to(device)  # [batch_size, seq_length -1]
+                    embeddings = support_batch['embeddings'].to(device)
+                    tokens = support_batch['tokens'].to(device)
+
+                    if embeddings.size(1) < 2:
+                        continue
+
+                    inputs = embeddings[:, :-1, :]
+                    targets = tokens[:, 1:]
+                    seq_len = min(inputs.size(1), targets.size(1))
+                    inputs = inputs[:, :seq_len, :]
+                    targets = targets[:, :seq_len]
+
                     if scaler:
                         with autocast():
-                            outputs = model(support_inputs, image_embeddings=None)
-                            loss = criterion(outputs["token_logits"][:, -1, :], support_targets)  # Берём только последний токен
-                            loss = loss / args.accumulation_steps
+                            outputs = model(inputs, image_embeddings=None)
+                            logits = outputs["token_logits"][:, :seq_len, :]
+                            language_loss = sequence_cross_entropy(logits, targets, criterion)
+                            vq_loss = outputs["vq_loss"]
+                            loss = (language_loss + VQ_LOSS_WEIGHT * vq_loss) / args.accumulation_steps
                         scaler.scale(loss).backward()
                         if (step + 1) % args.accumulation_steps == 0:
                             scaler.step(optimizer)
                             scaler.update()
                             optimizer.zero_grad()
                     else:
-                        outputs = model(support_inputs, image_embeddings=None)
-                        loss = criterion(outputs["token_logits"][:, -1, :], support_targets)  # Берём только последний токен
-                        loss = loss / args.accumulation_steps
+                        outputs = model(inputs, image_embeddings=None)
+                        logits = outputs["token_logits"][:, :seq_len, :]
+                        language_loss = sequence_cross_entropy(logits, targets, criterion)
+                        vq_loss = outputs["vq_loss"]
+                        loss = (language_loss + VQ_LOSS_WEIGHT * vq_loss) / args.accumulation_steps
                         loss.backward()
                         if (step + 1) % args.accumulation_steps == 0:
                             optimizer.step()
